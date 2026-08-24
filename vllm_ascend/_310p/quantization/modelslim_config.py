@@ -135,6 +135,24 @@ class AscendModelSlimConfig310(AscendModelSlimConfig):
 
                 logger.debug("Select AscendUnquantizedFusedMoEMethod310 for %s (layer=%s)", prefix, "FusedMoE")
                 return AscendUnquantizedFusedMoEMethod310(layer.moe_config)
+            from vllm_ascend.ascend_config import get_ascend_config
+
+            if get_ascend_config().hybrimoe_config.enabled:
+                quant_type = get_quant_type_for_layer(
+                    self.quant_description, prefix, "moe", self.packed_modules_mapping
+                )
+                if quant_type != "W8A8_DYNAMIC":
+                    raise RuntimeError(
+                        f"HybriMoE only supports W8A8_DYNAMIC MoE quantization on 310P, "
+                        f"but layer {prefix} uses {quant_type}."
+                    )
+                from vllm_ascend._310p.hybrimoe.fused_moe import (
+                    AscendHybriMoEMethod,
+                    AscendHybriMoEW8A8DynamicScheme310,
+                )
+
+                logger.debug("Select AscendHybriMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
+                return AscendHybriMoEMethod(AscendHybriMoEW8A8DynamicScheme310(), layer.moe_config)
             scheme = create_scheme_for_layer(self.quant_description, prefix, "moe", self.packed_modules_mapping)
             logger.debug("Select AscendFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
             return AscendFusedMoEMethod(scheme, layer.moe_config)

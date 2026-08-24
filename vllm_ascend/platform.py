@@ -524,6 +524,15 @@ class NPUPlatform(Platform):
                 logger.info("Falling back to FULL_DECODE_ONLY under xlite decode-only mode")
                 compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
+        if ascend_config.hybrimoe_config.enabled:
+            logger.info(
+                "HybriMoE is enabled: forcing eager mode because the hybrid CPU-NPU "
+                "MoE forward contains host synchronization that cannot be graph-captured."
+            )
+            enforce_eager = True
+            model_config.enforce_eager = True
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         if enforce_eager:
             logger.info("Compilation disabled, using eager mode by default")
             compilation_config.mode = CompilationMode.NONE

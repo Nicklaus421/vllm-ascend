@@ -110,6 +110,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable HybriMoE hybrid CPU-NPU MoE inference on Ascend 310P.
+    # 0 (default): disabled. 1: enabled. Equivalent to
+    # --additional-config '{"hybrimoe_config": {"enabled": true}}'.
+    "VLLM_ASCEND_HYBRIMOE_ENABLED": lambda: bool(int(os.getenv("VLLM_ASCEND_HYBRIMOE_ENABLED", "0"))),
 }
 
 # end-env-vars-definition

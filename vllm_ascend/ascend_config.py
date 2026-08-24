@@ -52,6 +52,16 @@ class AscendConfig:
         weight_prefetch_config = additional_config.get("weight_prefetch_config", {})
         self.weight_prefetch_config = WeightPrefetchConfig(weight_prefetch_config)
 
+        from vllm_ascend._310p.hybrimoe.config import HybriMoEConfig, hybrimoe_enabled_from_additional_config
+
+        hybrimoe_config = additional_config.get("hybrimoe_config", {})
+        self.hybrimoe_config = HybriMoEConfig(hybrimoe_config)
+        self.hybrimoe_config.enabled = self.hybrimoe_config.enabled or hybrimoe_enabled_from_additional_config(
+            additional_config
+        )
+        if self.hybrimoe_config.enabled:
+            self.hybrimoe_config.validate_against_vllm_config(vllm_config)
+
         profiling_chunk_config = additional_config.get("profiling_chunk_config", {})
         self.profiling_chunk_config = ProfilingChunkConfig(profiling_chunk_config)
         if self.profiling_chunk_config.enabled:

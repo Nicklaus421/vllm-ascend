@@ -1,0 +1,63 @@
+# ==========================================
+# HybriMoE: Qwen3.6-35B-A3B W8A8 on a single Ascend 310P chip.
+# Expert weights are offloaded to host DRAM; the NPU keeps a score-aware
+# (MRS) expert cache; decode uses HSS hybrid CPU/NPU scheduling with
+# impact-driven prefetching. See vllm_ascend/_310p/hybrimoe/.
+# ==========================================
+test_cases:
+  - name: "Qwen3.6-35B-A3B-HybriMoE-310P"
+    model: "Eco-Tech/Qwen3.6-35B-A3B-w8a8"
+    envs:
+      PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+      OMP_PROC_BIND: "false"
+      TASK_QUEUE_ENABLE: "1"
+      HCCL_BUFFSIZE: "1024"
+      SERVER_PORT: "DEFAULT_PORT"
+    server_cmd:
+      - "--quantization"
+      - "ascend"
+      - "--trust-remote-code"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--enforce-eager"
+      - "--port"
+      - "$SERVER_PORT"
+      - "--max-num-seqs"
+      - "16"
+      - "--max-model-len"
+      - "8192"
+      - "--max-num-batched-tokens"
+      - "2048"
+      - "--gpu-memory-utilization"
+      - "0.9"
+      - "--seed"
+      - "1024"
+      - "--no-enable-prefix-caching"
+      - "--additional-config"
+      - '{"hybrimoe_config": {"enabled": true, "npu_cache_budget_gb": 8.0, "prefetch_lookahead": 3, "prefetch_size": 2}}'
+    benchmarks:
+      acc:
+        case_type: accuracy
+        dataset_path: vllm-ascend/aime2025
+        request_conf: vllm_api_general_chat
+        dataset_conf: aime2025/aime2025_gen_0_shot_chat_prompt
+        max_out_len: 8192
+        batch_size: 8
+        baseline: 90
+        threshold: 10
+        temperature: 1.0
+        top_p: 0.95
+        top_k: 20
+        min_p: 0.0
+        presence_penalty: 1.5
+        repetition_penalty: 1.0
+      perf:
+        case_type: performance
+        dataset_path: vllm-ascend/GSM8K-in3500-bs400
+        request_conf: vllm_api_stream_chat
+        dataset_conf: gsm8k/gsm8k_gen_0_shot_cot_chat_prompt
+        num_prompts: 64
+        max_out_len: 512
+        batch_size: 8
+        request_rate: 4
+        range_ratio: 1.0

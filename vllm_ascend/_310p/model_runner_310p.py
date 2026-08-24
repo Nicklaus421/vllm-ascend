@@ -109,6 +109,13 @@ class NPUModelRunner310(NPUModelRunner):
             self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             logger.info_once("Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.")
 
+    def load_model(self) -> None:
+        super().load_model()
+        if self.ascend_config.hybrimoe_config.enabled:
+            from vllm_ascend._310p.hybrimoe.runtime import HybriMoERuntime
+
+            HybriMoERuntime.get().initialize_post_load(self.model)
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred = super()._update_states(scheduler_output)
         if scheduler_output.finished_req_ids:

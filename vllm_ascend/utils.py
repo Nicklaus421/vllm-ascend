@@ -810,9 +810,17 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             }
         )
         if vllm_version_is("0.23.0"):
-            from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310
+            from vllm_ascend._310p.hybrimoe.config import hybrimoe_enabled_from_additional_config
 
-            REGISTERED_ASCEND_OPS["FusedMoE"] = AscendFusedMoE310
+            _additional_config = getattr(vllm_config, "additional_config", None) if vllm_config is not None else None
+            if hybrimoe_enabled_from_additional_config(_additional_config):
+                from vllm_ascend._310p.hybrimoe.fused_moe import AscendHybriMoEFusedMoE310
+
+                REGISTERED_ASCEND_OPS["FusedMoE"] = AscendHybriMoEFusedMoE310
+            else:
+                from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310
+
+                REGISTERED_ASCEND_OPS["FusedMoE"] = AscendFusedMoE310
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
