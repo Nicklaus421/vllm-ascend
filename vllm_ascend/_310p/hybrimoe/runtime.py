@@ -63,13 +63,14 @@ class HybriMoERuntime:
     # ------------------------------------------------------------------
     # Lazy component access
     # ------------------------------------------------------------------
-    def get_executor(self, hidden_size: int) -> CPUExpertExecutor:
+    def get_executor(self, hidden_size: int, dtype: torch.dtype = torch.bfloat16) -> CPUExpertExecutor:
         if self.executor is None:
             self.executor = CPUExpertExecutor(
                 hidden_size=hidden_size,
                 max_tokens=self.config.decode_token_threshold,
                 num_cpu_threads=self.config.num_cpu_threads,
                 host_store_bf16=self.config.host_store_bf16,
+                dtype=dtype,
             )
         return self.executor
 
@@ -98,59 +99,84 @@ class HybriMoERuntime:
 
         # The executor is created lazily on the first decode forward, but
         # creating it here surfaces allocation problems at startup.
-        self.get_executor(hidden_size)
+        self.get_executor(hidden_size, dtype=first_layer.params_dtype)
 
         if self.config.prefetch_size > 0 and self.config.prefetch_lookahead > 0:
             self.prefetcher = ImpactDrivenPrefetcher(self.config, self.cache, self.registry, self.cost_model)
+        num_moe_layers = len(self.registry.layer_names)
+        num_slots = self.cache.get_layer(self.registry.layer_names[0]).num_slots
+        bytes_per_slot = (
+            first_layer.w13_weight.data[0].nbytes
+            + first_layer.w2_weight.data[0].nbytes
+            + first_layer.w13_weight_scale.data[0].nbytes
+            + first_layer.w2_weight_scale.data[0].nbytes
+        )
         logger.info(
-            "HybriMoE initialized: %d MoE layers, %d experts/layer, %d NPU slots/layer",
-            len(self.registry.layer_names),
+            "HybriMoE initialized: %d MoE layers, %d experts/layer, %d NPU slots/layer "
+            "(NPU expert cache total: %.2f GiB)",
+            num_moe_layers,
             self.cache.get_layer(self.registry.layer_names[0]).num_experts,
-            self.cache.get_layer(self.registry.layer_names[0]).num_slots,
+            num_slots,
+            bytes_per_slot * num_slots * num_moe_layers / float(2**30),
         )
 
     # ------------------------------------------------------------------
     # Cost-model calibration on the actual machine
     # ------------------------------------------------------------------
     def _calibrate(self, hidden_size: int, intermediate_size: int) -> CostModel:
+        from vllm.config import get_current_vllm_config
+
         from vllm_ascend._310p.fused_moe.moe_mlp import quant_apply_mlp
+        from vllm_ascend._310p.hybrimoe.scheduler import _CALIBRATION_TOKEN_POINTS
 
         iterations = self.config.calibration_iterations
+        # Activation dtype at runtime (float16 on 310P; the quant grouped
+        # matmul kernel rejects bfloat16 there).
+        model_dtype = get_current_vllm_config().model_config.dtype
 
         # NPU per-expert MLP timing (W8A8 dynamic grouped matmul, 1 expert).
-        npu_w13 = torch.randint(-8, 8, (1, 2 * intermediate_size, hidden_size), dtype=torch.int8, device="npu")
-        npu_w2 = torch.randint(-8, 8, (1, hidden_size, intermediate_size), dtype=torch.int8, device="npu")
+        # NOTE(310P): aclnnInplaceNormal does not support low-precision dtypes
+        # on this SoC, so random inputs are generated on the host and moved
+        # over. All inputs are pre-created OUTSIDE the timed function to keep
+        # allocation and transfer overhead out of the measurements.
+        npu_w13 = torch.randint(-8, 8, (1, 2 * intermediate_size, hidden_size), dtype=torch.int8).npu()
+        npu_w2 = torch.randint(-8, 8, (1, hidden_size, intermediate_size), dtype=torch.int8).npu()
         npu_w13_scale = torch.ones(1, 2 * intermediate_size, dtype=torch.float32, device="npu")
         npu_w2_scale = torch.ones(1, hidden_size, dtype=torch.float32, device="npu")
+        npu_inputs = {
+            n: torch.randn(n, hidden_size, dtype=torch.float32).to(model_dtype).npu() for n in _CALIBRATION_TOKEN_POINTS
+        }
+        npu_group_lists = {n: torch.tensor([n], dtype=torch.int64, device="npu") for n in _CALIBRATION_TOKEN_POINTS}
 
         def npu_mlp_fn(token_num: int) -> None:
-            x = torch.randn(token_num, hidden_size, dtype=torch.bfloat16, device="npu")
-            group_list = torch.tensor([token_num], dtype=torch.int64, device="npu")
             quant_apply_mlp(
-                hidden_states=x,
+                hidden_states=npu_inputs[token_num],
                 w1=npu_w13,
                 w1_scale=npu_w13_scale,
                 w2=npu_w2,
                 w2_scale=npu_w2_scale,
-                group_list=group_list,
+                group_list=npu_group_lists[token_num],
                 group_list_type=0,
             )
             torch.npu.synchronize()
 
-        # CPU per-expert MLP timing (bf16 dequantized weights).
-        cpu_w13 = torch.randn(2 * intermediate_size, hidden_size, dtype=torch.bfloat16)
-        cpu_w2 = torch.randn(hidden_size, intermediate_size, dtype=torch.bfloat16)
+        # CPU per-expert MLP timing (dequantized weights in the model dtype).
+        cpu_w13 = torch.randn(2 * intermediate_size, hidden_size, dtype=model_dtype)
+        cpu_w2 = torch.randn(hidden_size, intermediate_size, dtype=model_dtype)
+        cpu_inputs = {n: torch.randn(n, hidden_size, dtype=model_dtype) for n in _CALIBRATION_TOKEN_POINTS}
 
         def cpu_mlp_fn(token_num: int) -> None:
-            x = torch.randn(token_num, hidden_size, dtype=torch.bfloat16)
+            x = cpu_inputs[token_num]
             gate = x @ cpu_w13[:intermediate_size].t()
             up = x @ cpu_w13[intermediate_size:].t()
             hidden = torch.nn.functional.silu(gate) * up
             _ = hidden @ cpu_w2.t()
 
         # H2D transfer timing for one expert (int8 weights + fp32 scales).
-        host_w13 = pin_memory_if_available(torch.empty(2 * intermediate_size, hidden_size, dtype=torch.int8))
-        host_w2 = pin_memory_if_available(torch.empty(hidden_size, intermediate_size, dtype=torch.int8))
+        host_w13 = pin_memory_if_available(
+            torch.empty(2 * intermediate_size, hidden_size, dtype=torch.int8, device="cpu")
+        )
+        host_w2 = pin_memory_if_available(torch.empty(hidden_size, intermediate_size, dtype=torch.int8, device="cpu"))
         dev_w13 = torch.empty_like(npu_w13)
         dev_w2 = torch.empty_like(npu_w2)
 

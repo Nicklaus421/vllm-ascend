@@ -98,6 +98,7 @@ class CPUExpertExecutor:
         num_cpu_threads: int,
         host_store_bf16: bool = True,
         device: str = "npu",
+        dtype: torch.dtype = torch.bfloat16,
     ):
         cores = num_cpu_threads if num_cpu_threads > 0 else (os.cpu_count() or _MAX_WORKERS)
         self.num_workers = max(1, min(cores, _MAX_WORKERS))
@@ -110,12 +111,13 @@ class CPUExpertExecutor:
         self.hidden_size = hidden_size
         self.max_tokens = max_tokens
         self.host_store_bf16 = host_store_bf16
+        self.dtype = dtype
         self.in_buffers = [
-            pin_memory_if_available(torch.empty(max_tokens, hidden_size, dtype=torch.bfloat16))
+            pin_memory_if_available(torch.empty(max_tokens, hidden_size, dtype=dtype, device="cpu"))
             for _ in range(_IO_BUFFER_COUNT)
         ]
         self.out_host_buffers = [
-            pin_memory_if_available(torch.zeros(max_tokens, hidden_size, dtype=torch.float32))
+            pin_memory_if_available(torch.zeros(max_tokens, hidden_size, dtype=torch.float32, device="cpu"))
             for _ in range(_IO_BUFFER_COUNT)
         ]
         self.out_npu_buffers = [
@@ -124,7 +126,7 @@ class CPUExpertExecutor:
         # Per-worker fp32 accumulation shards (pageable; only the reduced
         # buffer needs to be pinned for H2D).
         self._worker_buffers = [
-            [torch.zeros(max_tokens, hidden_size, dtype=torch.float32) for _ in range(_IO_BUFFER_COUNT)]
+            [torch.zeros(max_tokens, hidden_size, dtype=torch.float32, device="cpu") for _ in range(_IO_BUFFER_COUNT)]
             for _ in range(self.num_workers)
         ]
         # Latest consumer event per output buffer; the copy stream waits on
@@ -206,15 +208,15 @@ class CPUExpertExecutor:
         for expert_id, token_idx, weights in tasks:
             rows = in_buf[token_idx]
             if self.host_store_bf16:
-                w13 = layer.host_w13_bf16[expert_id]
-                w2 = layer.host_w2_bf16[expert_id]
+                w13 = layer.host_w13_dequant[expert_id]
+                w2 = layer.host_w2_dequant[expert_id]
             else:
-                # On-the-fly dequant: (int8 * per-channel scale) -> bf16.
+                # On-the-fly dequant: (int8 * per-channel scale) -> executor dtype.
                 w13 = (layer.host_w13_int8[expert_id].float() * layer.host_w13_scale[expert_id].unsqueeze(1)).to(
-                    torch.bfloat16
+                    self.dtype
                 )
                 w2 = (layer.host_w2_int8[expert_id].float() * layer.host_w2_scale[expert_id].unsqueeze(1)).to(
-                    torch.bfloat16
+                    self.dtype
                 )
             intermediate = w13.shape[0] // 2
             gate = rows @ w13[:intermediate].t()

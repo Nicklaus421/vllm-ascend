@@ -30,15 +30,15 @@ MAX_TOKENS = 4
 
 class _FakeLayer:
     def __init__(self, num_experts: int):
-        self.host_w13_bf16 = torch.randn(num_experts, 2 * INTERMEDIATE, HIDDEN, dtype=torch.bfloat16)
-        self.host_w2_bf16 = torch.randn(num_experts, HIDDEN, INTERMEDIATE, dtype=torch.bfloat16)
+        self.host_w13_dequant = torch.randn(num_experts, 2 * INTERMEDIATE, HIDDEN, dtype=torch.bfloat16)
+        self.host_w2_dequant = torch.randn(num_experts, HIDDEN, INTERMEDIATE, dtype=torch.bfloat16)
 
 
 def _reference_mlp(layer, expert: int, rows: torch.Tensor) -> torch.Tensor:
-    w13 = layer.host_w13_bf16[expert]
+    w13 = layer.host_w13_dequant[expert]
     gate = rows @ w13[:INTERMEDIATE].t()
     up = rows @ w13[INTERMEDIATE:].t()
-    return (F.silu(gate) * up) @ layer.host_w2_bf16[expert].t()
+    return (F.silu(gate) * up) @ layer.host_w2_dequant[expert].t()
 
 
 def test_cpu_executor_matches_reference():

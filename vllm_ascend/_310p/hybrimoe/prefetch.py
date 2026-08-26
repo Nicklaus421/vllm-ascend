@@ -99,7 +99,7 @@ class ImpactDrivenPrefetcher:
             buffer = self._pred_buffers[ring]
             needed = num_tokens * top_k
             if buffer is None or buffer.numel() < needed:
-                buffer = pin_memory_if_available(torch.empty(needed, dtype=torch.int64))
+                buffer = pin_memory_if_available(torch.empty(needed, dtype=torch.int64, device="cpu"))
                 self._pred_buffers[ring] = buffer
             gate = self.registry.gate_modules[next_position]
             logits, _ = gate(x)

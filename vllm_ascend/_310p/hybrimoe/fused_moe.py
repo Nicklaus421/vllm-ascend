@@ -24,7 +24,7 @@ Implements the HybriMoE forward path (https://arxiv.org/abs/2504.05897):
     and the CPU; the NPU computes its share via a slot-remapped grouped
     matmul (CPU-bound pairs get the sentinel slot with routing weight 0,
     which contributes exactly 0 at combine time), the CPU computes its share
-    asynchronously from the bf16 host copies, and the partial results are
+    asynchronously from the host dequantized copies, and the partial results are
     summed.
 
 Weight layout:
@@ -32,7 +32,7 @@ Weight layout:
     NZ casting of single slots is left as a future optimization, see the
     design doc / R1).
   - Host: pinned int8 weights + fp32 scales (source of truth for H2D) and
-    pageable bf16 dequantized weights (for CPU compute, optional).
+    pageable dequantized weights in params_dtype (for CPU compute, optional).
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ from vllm_ascend._310p.hybrimoe.runtime import HybriMoERuntime
 from vllm_ascend._310p.hybrimoe.scheduler import hss_schedule
 from vllm_ascend._310p.hybrimoe.utils import dequant_int8_per_channel, pin_memory_if_available
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
 from vllm_ascend.ops.fused_moe.moe_stage_contracts import MoETokenDispatchInput
 from vllm_ascend.ops.fused_moe.moe_stage_params import MoEQuantParams, MoERoutingParams
 from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
@@ -73,6 +74,16 @@ def derive_num_slots(config, num_experts: int, hidden_size: int, intermediate_si
             "HybriMoE npu_cache_budget_gb=%.2f is too small for even one expert slot per layer; "
             "clamping to 1 slot per layer.",
             config.npu_cache_budget_gb,
+        )
+    if slots >= num_experts:
+        logger.warning(
+            "HybriMoE derived %d slots per layer >= num_experts (%d): the entire expert set would be "
+            "NPU-resident, which defeats the purpose of expert offloading and wastes HBM. Check that "
+            "npu_cache_budget_gb (%.2f) and the MoE layer count (%d) are as intended.",
+            slots,
+            num_experts,
+            config.npu_cache_budget_gb,
+            num_moe_layers,
         )
     return max(1, min(slots, num_experts))
 
@@ -113,12 +124,26 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
     def _num_slots(self, num_experts: int, intermediate_size: int, hidden_size: int) -> int:
         from vllm.config import get_current_vllm_config
 
-        hf_config = get_current_vllm_config().model_config.hf_config
-        num_moe_layers = getattr(hf_config, "num_hidden_layers", 1)
+        # An explicit slot count wins over budget-based derivation and does
+        # not require knowing the MoE layer count.
+        if self.config.npu_cache_slots_per_layer is not None:
+            return max(1, min(self.config.npu_cache_slots_per_layer, num_experts))
+
+        model_config = get_current_vllm_config().model_config
+        # vLLM resolves the text-side config for both plain LM and VL models
+        # (whose HF config may nest it under text_config or other keys).
+        text_config = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+        num_moe_layers = getattr(text_config, "num_hidden_layers", None)
+        if num_moe_layers is None:
+            raise RuntimeError(
+                "HybriMoE: could not determine the number of MoE layers from the model config "
+                f"(type={getattr(model_config.hf_config, 'model_type', '?')}). Set hybrimoe_config."
+                "npu_cache_slots_per_layer explicitly to bypass budget-based derivation."
+            )
         return derive_num_slots(self.config, num_experts, hidden_size, intermediate_size, num_moe_layers)
 
     # ------------------------------------------------------------------
-    # Post-loading: bf16 dequant, initial slot fill, cache registration.
+    # Post-loading: dequant, initial slot fill, cache registration.
     # ------------------------------------------------------------------
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         runtime = HybriMoERuntime.get()
@@ -126,7 +151,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         num_slots = layer.w13_weight.shape[0]
 
         if runtime.config.host_store_bf16:
-            layer.dequant_host_weights_bf16()
+            layer.dequant_host_weights()
 
         # Initial cache content: experts 0..num_slots-1 (all MRS scores are
         # equal at this point, so the choice is arbitrary).
@@ -209,10 +234,13 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         # NOTE: the phase is decided by the token count; the `is_prefill`
         # argument is never set by the 310P forward path.
         if num_tokens > runtime.config.decode_token_threshold:
-            return self._prefill_forward(runtime, state, layer, x, topk_ids, topk_weights, router_logits, scoring_func)
-        return self._decode_forward(
-            runtime, state, layer, x, topk_ids, topk_weights, router_logits, top_k, scoring_func
-        )
+            out = self._prefill_forward(runtime, state, layer, x, topk_ids, topk_weights, router_logits, scoring_func)
+        else:
+            out = self._decode_forward(
+                runtime, state, layer, x, topk_ids, topk_weights, router_logits, top_k, scoring_func
+            )
+        # forward_impl expects a FusedExpertsResult, not a bare tensor.
+        return FusedExpertsResult(routed_out=out)
 
     # ------------------------------------------------------------------
     # Prefill: every activated expert computed on the NPU.
@@ -279,7 +307,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         cache = runtime.cache
         num_tokens = x.shape[0]
         num_experts = state.num_experts
-        executor = runtime.get_executor(x.shape[1])
+        executor = runtime.get_executor(x.shape[1], dtype=layer.params_dtype)
         buffer_index = executor.next_buffer()
         main_stream = torch.npu.current_stream()
 
@@ -470,21 +498,33 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
         num_experts = self.global_num_experts
         hidden_size = self.hidden_size
         intermediate_size = self.intermediate_size_per_partition
-        # Host weight buffers (source of truth for H2D transfers).
-        self.host_w13_int8 = torch.empty(num_experts, 2 * intermediate_size, hidden_size, dtype=torch.int8)
-        self.host_w2_int8 = torch.empty(num_experts, hidden_size, intermediate_size, dtype=torch.int8)
-        self.host_w13_scale = torch.empty(num_experts, 2 * intermediate_size, dtype=torch.float32)
-        self.host_w2_scale = torch.empty(num_experts, hidden_size, dtype=torch.float32)
-        self.host_w13_offset = torch.zeros(num_experts, 2 * intermediate_size, dtype=torch.float32)
-        self.host_w2_offset = torch.zeros(num_experts, hidden_size, dtype=torch.float32)
-        self.host_w13_int8 = pin_memory_if_available(self.host_w13_int8)
-        self.host_w2_int8 = pin_memory_if_available(self.host_w2_int8)
-        self.host_w13_scale = pin_memory_if_available(self.host_w13_scale)
-        self.host_w2_scale = pin_memory_if_available(self.host_w2_scale)
-        # bf16 dequantized copies for CPU compute (pageable; never go H2D).
+        # Host weight buffers (source of truth for H2D transfers). NOTE: the
+        # default device is the NPU during model construction, so the device
+        # must be pinned to CPU explicitly here.
+        self.host_w13_int8 = torch.empty(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.int8, device="cpu"
+        )
+        self.host_w2_int8 = torch.empty(num_experts, hidden_size, intermediate_size, dtype=torch.int8, device="cpu")
+        self.host_w13_scale = torch.empty(num_experts, 2 * intermediate_size, dtype=torch.float32, device="cpu")
+        self.host_w2_scale = torch.empty(num_experts, hidden_size, dtype=torch.float32, device="cpu")
+        self.host_w13_offset = torch.zeros(num_experts, 2 * intermediate_size, dtype=torch.float32, device="cpu")
+        self.host_w2_offset = torch.zeros(num_experts, hidden_size, dtype=torch.float32, device="cpu")
+        # Pinning the multi-GB buffers is opt-in (hybrimoe_config.pin_host_weights);
+        # the 310P driver limits registered host memory.
+        if config.pin_host_weights:
+            self.host_w13_int8 = pin_memory_if_available(self.host_w13_int8)
+            self.host_w2_int8 = pin_memory_if_available(self.host_w2_int8)
+            self.host_w13_scale = pin_memory_if_available(self.host_w13_scale)
+            self.host_w2_scale = pin_memory_if_available(self.host_w2_scale)
+        # Dequantized copies for CPU compute, in the model's params_dtype
+        # (float16 on 310P; pageable, never go H2D).
         if config.host_store_bf16:
-            self.host_w13_bf16 = torch.empty(num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16)
-            self.host_w2_bf16 = torch.empty(num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16)
+            self.host_w13_dequant = torch.empty(
+                num_experts, 2 * intermediate_size, hidden_size, dtype=self.params_dtype, device="cpu"
+            )
+            self.host_w2_dequant = torch.empty(
+                num_experts, hidden_size, intermediate_size, dtype=self.params_dtype, device="cpu"
+            )
 
     # ------------------------------------------------------------------
     # Weight loading interception
@@ -537,10 +577,14 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
     # ------------------------------------------------------------------
     # Post-loading helpers (called from the scheme)
     # ------------------------------------------------------------------
-    def dequant_host_weights_bf16(self) -> None:
-        """Dequantize the host int8 weights to bf16 for CPU compute."""
-        self.host_w13_bf16.copy_(dequant_int8_per_channel(self.host_w13_int8, self.host_w13_scale))
-        self.host_w2_bf16.copy_(dequant_int8_per_channel(self.host_w2_int8, self.host_w2_scale))
+    def dequant_host_weights(self) -> None:
+        """Dequantize the host int8 weights into params_dtype for CPU compute."""
+        self.host_w13_dequant.copy_(
+            dequant_int8_per_channel(self.host_w13_int8, self.host_w13_scale, out_dtype=self.params_dtype)
+        )
+        self.host_w2_dequant.copy_(
+            dequant_int8_per_channel(self.host_w2_int8, self.host_w2_scale, out_dtype=self.params_dtype)
+        )
 
     def create_hybrimoe_staging_buffers(self) -> None:
         """Pinned host + NPU staging buffers for the per-forward routing pack."""
@@ -551,9 +595,11 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
         top_k = self.top_k
         top_p = min(get_ascend_config().hybrimoe_config.top_p_factor * top_k, self.global_num_experts)
         self.hybrimoe_top_p = top_p
-        self.pin_topk_ids = pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int64))
-        self.pin_topk_w = pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.float32))
-        self.pin_top_p_ids = pin_memory_if_available(torch.empty(max_tokens * top_p, dtype=torch.int64))
-        self.pin_top_p_scores = pin_memory_if_available(torch.empty(max_tokens * top_p, dtype=torch.float32))
+        self.pin_topk_ids = pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int64, device="cpu"))
+        self.pin_topk_w = pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.float32, device="cpu"))
+        self.pin_top_p_ids = pin_memory_if_available(torch.empty(max_tokens * top_p, dtype=torch.int64, device="cpu"))
+        self.pin_top_p_scores = pin_memory_if_available(
+            torch.empty(max_tokens * top_p, dtype=torch.float32, device="cpu")
+        )
         self.dev_topk_ids = torch.empty(max_tokens * top_k, dtype=torch.int32, device="npu")
         self.dev_topk_w = torch.empty(max_tokens * top_k, dtype=self.params_dtype, device="npu")

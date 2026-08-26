@@ -52,6 +52,9 @@ _FALLBACK_NPU_COEF_MS = 0.0
 _FALLBACK_NPU_PER_EXPERT_MS = 0.5
 _FALLBACK_MOVE_MS = 0.41791011235117914
 
+# Token-count sample points used for the linear cost-model calibration.
+_CALIBRATION_TOKEN_POINTS = [1, 8, 32]
+
 
 def _fit_linear(xs: list[float], ys: list[float]) -> tuple[float, float]:
     """Least-squares fit of y = coef * x + intercept (closed form, 2 params)."""
@@ -233,6 +236,9 @@ class _WallClock:
         self._start = time.perf_counter()
         return self
 
+    def __exit__(self, *exc_info):
+        return False
+
     def elapsed_ms(self) -> float:
         return (time.perf_counter() - self._start) * 1000.0
 
@@ -259,7 +265,7 @@ def calibrate_cost_model(
     del hidden_size  # shapes are baked into the callables by the caller
 
     model = CostModel()
-    token_points = [1, 8, 32]
+    token_points = _CALIBRATION_TOKEN_POINTS
 
     if cpu_mlp_fn is not None:
         xs, ys = [], []

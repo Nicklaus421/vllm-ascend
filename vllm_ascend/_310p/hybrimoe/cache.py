@@ -17,7 +17,7 @@
 """HybriMoE expert cache: NPU slot tables + MRS score-aware replacement.
 
 Every MoE layer owns `num_slots` NPU-resident expert slots. The host keeps
-the full expert set (int8 weights for H2D transfer, bf16 dequantized weights
+the full expert set (int8 weights for H2D transfer, dequantized weights
 for CPU compute) and tracks:
 
   - slot_to_expert / expert_to_slot: the residency mapping (host only; the
@@ -50,9 +50,11 @@ class HybriMoELayerState:
         self.layer_name = layer_name
         self.num_experts = num_experts
         self.num_slots = num_slots
-        self.expert_to_slot = torch.full((num_experts,), -1, dtype=torch.int32)
+        # Host-side state; pin the device explicitly because this may be
+        # constructed while the default device is the NPU (model loading).
+        self.expert_to_slot = torch.full((num_experts,), -1, dtype=torch.int32, device="cpu")
         self.slot_to_expert: list[int] = [-1] * num_slots
-        self.scores = torch.zeros(num_experts, dtype=torch.float32)
+        self.scores = torch.zeros(num_experts, dtype=torch.float32, device="cpu")
         # expert id -> (slot, event) for transfers that have been enqueued on
         # a copy/prefetch stream but not yet consumed by the compute stream.
         self.in_flight: dict[int, tuple[int, object]] = {}

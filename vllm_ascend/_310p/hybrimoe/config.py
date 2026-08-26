@@ -59,9 +59,14 @@ class HybriMoEConfig:
         self.prefetch_size: int = int(config.get("prefetch_size", 2))
         # 0 means "use all physical cores".
         self.num_cpu_threads: int = int(config.get("num_cpu_threads", 0))
-        # Store a bf16 dequantized copy of expert weights on the host for CPU
-        # compute. False halves host memory at the cost of on-the-fly dequant.
+        # Store a dequantized copy of expert weights (in the model's
+        # params_dtype) on the host for CPU compute. False halves host memory
+        # at the cost of on-the-fly dequant.
         self.host_store_bf16: bool = bool(config.get("host_store_bf16", True))
+        # Pin the (multi-GB) int8 host weight buffers for async H2D. Default
+        # off: registering tens of GB with the 310P driver can break the host
+        # allocator; pageable buffers fall back to synchronous H2D copies.
+        self.pin_host_weights: bool = bool(config.get("pin_host_weights", False))
         # Token count at or below which a forward is treated as decode and the
         # hybrid CPU/NPU schedule is applied.
         self.decode_token_threshold: int = int(config.get("decode_token_threshold", 32))

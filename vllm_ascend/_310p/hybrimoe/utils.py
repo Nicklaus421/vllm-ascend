@@ -41,22 +41,25 @@ _DEQUANT_EXPERT_CHUNK = 8
 def dequant_int8_per_channel(
     w_int8: torch.Tensor,
     scale: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
     chunk: int = _DEQUANT_EXPERT_CHUNK,
 ) -> torch.Tensor:
-    """Dequantize per-channel int8 weights to bf16: w = q * scale.
+    """Dequantize per-channel int8 weights: w = q * scale.
 
     Args:
         w_int8: [E, out, in] int8 weights.
         scale: [E, out] fp32 per-output-channel scales.
+        out_dtype: dtype of the dequantized weights (the model's params_dtype,
+            float16 on 310P).
         chunk: experts per chunk (bounds the fp32 temporary).
 
     Returns:
-        [E, out, in] bf16 dequantized weights.
+        [E, out, in] dequantized weights in `out_dtype`.
     """
     num_experts = w_int8.shape[0]
-    out = torch.empty(num_experts, *w_int8.shape[1:], dtype=torch.bfloat16)
+    out = torch.empty(num_experts, *w_int8.shape[1:], dtype=out_dtype, device=w_int8.device)
     for start in range(0, num_experts, chunk):
         end = min(start + chunk, num_experts)
         dequantized = w_int8[start:end].float() * scale[start:end].unsqueeze(-1)
-        out[start:end].copy_(dequantized.to(torch.bfloat16))
+        out[start:end].copy_(dequantized.to(out_dtype))
     return out
