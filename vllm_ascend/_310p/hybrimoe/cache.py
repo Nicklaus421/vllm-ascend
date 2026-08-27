@@ -147,7 +147,7 @@ class HybriMoECache:
         # at startup; falls back to ND on failure).
         self.use_nz_slots = True
         self.nz_validated = False
-        self._foreach_copy_ok = None
+        self._foreach_copy_ok: dict[str, bool] = {}
 
     # ------------------------------------------------------------------
     # Streams (created lazily so importing this module never touches NPU).
@@ -381,18 +381,23 @@ class HybriMoECache:
                         self._foreach_copy(
                             [staging13[i] for i in range(n)] + [staging2[i] for i in range(n)],
                             [layer.host_w13_int8[e] for e in experts] + [layer.host_w2_int8[e] for e in experts],
+                            group="staging_weights",
                         )
                     nz13 = torch_npu.npu_format_cast(staging13[:n], ACL_FORMAT_FRACTAL_NZ)
                     nz2 = torch_npu.npu_format_cast(staging2[:n], ACL_FORMAT_FRACTAL_NZ)
+                    # NOTE: foreach_copy does not support NZ (internal format)
+                    # destinations, so the slot NZ blocks go in their own
+                    # group; scales are plain-format and share another.
                     self._foreach_copy(
-                        [layer.w13_weight.data[s] for s in slots]
-                        + [layer.w2_weight.data[s] for s in slots]
-                        + [layer.w13_weight_scale.data[s] for s in slots]
+                        [layer.w13_weight.data[s] for s in slots] + [layer.w2_weight.data[s] for s in slots],
+                        list(nz13.unbind(0)) + list(nz2.unbind(0)),
+                        group="nz_slot_weights",
+                    )
+                    self._foreach_copy(
+                        [layer.w13_weight_scale.data[s] for s in slots]
                         + [layer.w2_weight_scale.data[s] for s in slots],
-                        list(nz13.unbind(0))
-                        + list(nz2.unbind(0))
-                        + [layer.host_w13_scale[e] for e in experts]
-                        + [layer.host_w2_scale[e] for e in experts],
+                        [layer.host_w13_scale[e] for e in experts] + [layer.host_w2_scale[e] for e in experts],
+                        group="scales",
                     )
                 else:
                     self._foreach_copy(
@@ -404,29 +409,31 @@ class HybriMoECache:
                         + [layer.host_w2_int8[e] for e in experts]
                         + [layer.host_w13_scale[e] for e in experts]
                         + [layer.host_w2_scale[e] for e in experts],
+                        group="nd_all",
                     )
 
-    def _foreach_copy(self, dsts: list[torch.Tensor], srcs: list[torch.Tensor]) -> None:
-        """Batched copy via torch._foreach_copy_ (one op for the whole list).
+    def _foreach_copy(self, dsts: list[torch.Tensor], srcs: list[torch.Tensor], group: str) -> None:
+        """Batched copy via torch._foreach_copy_ with per-group fallback.
 
-        Falls back to a plain loop when the foreach op is unsupported, so
-        transfers cost O(1) op launches instead of O(len(dsts)) whenever
-        possible.
+        Some destinations are unsupported by foreach_copy (e.g. NZ / internal
+        format tensors): the first failing group is remembered and all later
+        copies of that group use a plain loop. copy_ is idempotent, so
+        re-copying a partially-foreach'd group after a launch-time failure is
+        safe.
         """
         if not dsts:
             return
-        if self._foreach_copy_ok is None:
+        if self._foreach_copy_ok.get(group, True):
             try:
-                torch._foreach_copy_(dsts[:1], srcs[:1], non_blocking=True)
-                self._foreach_copy_ok = True
+                torch._foreach_copy_(dsts, srcs, non_blocking=True)
+                return
             except Exception:  # noqa: BLE001
-                self._foreach_copy_ok = False
-                logger.warning_once("HybriMoE: torch._foreach_copy_ unavailable; using per-tensor copies.")
-        if self._foreach_copy_ok:
-            torch._foreach_copy_(dsts, srcs, non_blocking=True)
-        else:
-            for dst, src in zip(dsts, srcs):
-                dst.copy_(src, non_blocking=True)
+                self._foreach_copy_ok[group] = False
+                logger.warning_once(
+                    "HybriMoE: torch._foreach_copy_ unsupported for %s; using per-tensor copies.", group
+                )
+        for dst, src in zip(dsts, srcs):
+            dst.copy_(src, non_blocking=True)
 
     def hit_rate(self) -> float:
         hits = sum(s.hits for s in self.layers.values())
