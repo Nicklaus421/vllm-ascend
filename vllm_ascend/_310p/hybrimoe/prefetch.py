@@ -46,6 +46,10 @@ from .registry import HybriMoERegistry
 from .scheduler import CostModel, simulate_makespan
 from .utils import pin_memory_if_available
 
+# Cap on candidates entering the per-expert gain simulation; each candidate
+# costs two HSS simulations on the host.
+_MAX_GAIN_CANDIDATES = 8
+
 
 class ImpactDrivenPrefetcher:
     def __init__(
@@ -73,6 +77,7 @@ class ImpactDrivenPrefetcher:
         x: torch.Tensor,
         top_k: int,
         scoring_func: str,
+        prefill: bool = False,
     ) -> None:
         position = self.registry.position_of(state.layer_name)
         num_tokens = x.shape[0]
@@ -87,7 +92,7 @@ class ImpactDrivenPrefetcher:
             if not event.query():
                 continue
             del self._pending[next_position]
-            self._issue_prefetches(next_position, buffer[: tokens * k])
+            self._issue_prefetches(next_position, buffer[: tokens * k], prefill)
 
         # 2. Launch predictions for upcoming layers into free ring slots.
         busy_rings = {p % self.lookahead for p in self._pending}
@@ -110,7 +115,7 @@ class ImpactDrivenPrefetcher:
             busy_rings.add(ring)
 
     # ------------------------------------------------------------------
-    def _issue_prefetches(self, next_position: int, predicted_ids: torch.Tensor) -> None:
+    def _issue_prefetches(self, next_position: int, predicted_ids: torch.Tensor, prefill: bool) -> None:
         next_state = self.cache.get_layer(self.registry.layer_names[next_position])
         num_experts = next_state.num_experts
         counts_tensor = torch.bincount(predicted_ids, minlength=num_experts)
@@ -124,24 +129,32 @@ class ImpactDrivenPrefetcher:
         if not uncached:
             return
 
-        base_makespan = simulate_makespan(cached, uncached, counts, self.cost_model)
-        gains = []
-        for expert in uncached:
-            with_expert = simulate_makespan(
-                cached + [expert],
-                [e for e in uncached if e != expert],
-                counts,
-                self.cost_model,
-            )
-            gain = base_makespan - with_expert - self.cost_model.move_time()
-            gains.append((gain, expert))
-        gains.sort(reverse=True)
+        if prefill:
+            # Prefill activates nearly every expert, so the gain simulation
+            # adds nothing; just prefetch the highest-load candidates.
+            candidates = sorted(uncached, key=lambda e: counts[e], reverse=True)
+            selected = candidates[: self.prefetch_size]
+        else:
+            # Impact-driven: simulate the HSS makespan gain per candidate.
+            # Cap candidates to bound the host-side cost of the simulation.
+            candidates = sorted(uncached, key=lambda e: counts[e], reverse=True)[:_MAX_GAIN_CANDIDATES]
+            base_makespan = simulate_makespan(cached, uncached, counts, self.cost_model)
+            gains = []
+            for expert in candidates:
+                with_expert = simulate_makespan(
+                    cached + [expert],
+                    [e for e in uncached if e != expert],
+                    counts,
+                    self.cost_model,
+                )
+                gain = base_makespan - with_expert - self.cost_model.move_time()
+                gains.append((gain, expert))
+            gains.sort(reverse=True)
+            selected = [expert for gain, expert in gains[: self.prefetch_size] if gain > 0]
 
         protected = set(activated) | in_flight
         issued = 0
-        for gain, expert in gains:
-            if issued >= self.prefetch_size or gain <= 0:
-                break
+        for expert in selected:
             self.cache.enqueue_transfer(next_state, expert, protected, self.cache.prefetch_stream)
             issued += 1
         if issued:

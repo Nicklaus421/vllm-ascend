@@ -63,10 +63,14 @@ class HybriMoEConfig:
         # params_dtype) on the host for CPU compute. False halves host memory
         # at the cost of on-the-fly dequant.
         self.host_store_bf16: bool = bool(config.get("host_store_bf16", True))
-        # Pin the (multi-GB) int8 host weight buffers for async H2D. Default
-        # off: registering tens of GB with the 310P driver can break the host
-        # allocator; pageable buffers fall back to synchronous H2D copies.
-        self.pin_host_weights: bool = bool(config.get("pin_host_weights", False))
+        # Pin the (multi-GB) int8 host weight buffers for async H2D. On hosts
+        # with ample RAM this is strongly recommended: pageable copies block
+        # the host per expert and are far slower. Disable only if the 310P
+        # driver rejects large registered-memory regions.
+        self.pin_host_weights: bool = bool(config.get("pin_host_weights", True))
+        # Per-phase host-side timing of the HybriMoE forward path, logged
+        # periodically. For performance debugging only.
+        self.profile_phases: bool = bool(config.get("profile_phases", False))
         # Token count at or below which a forward is treated as decode and the
         # hybrid CPU/NPU schedule is applied.
         self.decode_token_threshold: int = int(config.get("decode_token_threshold", 32))

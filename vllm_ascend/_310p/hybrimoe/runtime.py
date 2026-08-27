@@ -24,6 +24,8 @@ calibrates the cost model and creates the CPU executor / prefetcher.
 
 from __future__ import annotations
 
+import time
+
 import torch
 from vllm.logger import logger
 
@@ -44,6 +46,23 @@ class HybriMoERuntime:
         self.executor: CPUExpertExecutor | None = None
         self.prefetcher = None
         self.registry = None
+        self._phase_stats: dict[str, float] = {}
+        self._phase_calls = 0
+
+    # ------------------------------------------------------------------
+    # Optional per-phase host timing (profile_phases)
+    # ------------------------------------------------------------------
+    def record_phase(self, name: str, start: float) -> None:
+        stats = self._phase_stats
+        stats[name] = stats.get(name, 0.0) + (time.perf_counter() - start) * 1000.0
+
+    def tick_phase_log(self, log_every: int = 256) -> None:
+        self._phase_calls += 1
+        if self._phase_calls % log_every != 0:
+            return
+        message = ", ".join(f"{name}={total / log_every:.3f}ms" for name, total in sorted(self._phase_stats.items()))
+        logger.info("HybriMoE phase timings (avg over %d layer calls): %s", log_every, message)
+        self._phase_stats.clear()
 
     @classmethod
     def get(cls) -> HybriMoERuntime:

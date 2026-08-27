@@ -124,16 +124,30 @@ class TestTransfers:
         assert int(state.expert_to_slot[7].item()) == 1
         assert state.slot_to_expert[1] == 7
 
-    def test_ensure_resident_loads_all_missing(self):
+    def test_batch_transfers_load_all_missing(self):
         layer = _FakeLayer(num_experts=8, num_slots=4)
         cache = HybriMoECache(HybriMoEConfig({"enabled": True}))
         cache._copy_stream = MagicMock()
         state = cache.register_layer(layer, num_experts=8, num_slots=4)
-        events = cache.ensure_resident(state, [1, 2, 3])
-        assert len(events) == 3
+        cache.enqueue_transfers(state, [1, 2, 3], protected=set(), stream=cache.copy_stream)
         for e in (1, 2, 3):
             assert state.is_resident(e)
-        # Second call hits the in-flight entries (no new transfers).
-        events = cache.ensure_resident(state, [1, 2, 3])
-        assert len(events) == 3
+            assert torch.equal(layer.w13_weight.data[int(state.expert_to_slot[e].item())], layer.host_w13_int8[e])
+        events = cache.collect_transfer_events(state, [1, 2, 3])
+        assert len(events) == 3  # all share the batch event, popped individually
         assert state.misses == 3
+
+    def test_batch_eviction_protects_activated(self):
+        layer = _FakeLayer(num_experts=8, num_slots=2)
+        cache = HybriMoECache(HybriMoEConfig({"enabled": True}))
+        cache._copy_stream = MagicMock()
+        state = cache.register_layer(layer, num_experts=8, num_slots=2)
+        state.expert_to_slot[0] = 0
+        state.expert_to_slot[1] = 1
+        state.slot_to_expert = [0, 1]
+        state.scores = torch.tensor([0.9, 0.1, 0, 0, 0, 0, 0, 0], dtype=torch.float32)
+        cache.enqueue_transfers(state, [7], protected={1}, stream=cache.copy_stream)
+        # expert 0 evicted (expert 1 protected); expert 7 took slot 0
+        assert int(state.expert_to_slot[0].item()) == -1
+        assert int(state.expert_to_slot[7].item()) == 0
+        assert state.slot_to_expert[0] == 7

@@ -105,6 +105,21 @@ class HybriMoELayerState:
         victim_expert = int(torch.argmin(masked_scores).item())
         return int(self.expert_to_slot[victim_expert].item())
 
+    def select_victim_slots(self, count: int, protected: set[int]) -> list[int]:
+        """Batch victim selection: slots of the `count` lowest-score eligible residents."""
+        resident = self.expert_to_slot >= 0
+        candidates = resident.clone()
+        if protected:
+            protected_ids = torch.tensor(sorted(protected), dtype=torch.int64)
+            candidates[protected_ids] = False
+        pool = candidates if bool(candidates.any()) else resident
+        masked_scores = torch.where(pool, self.scores, torch.full_like(self.scores, float("inf")))
+        count = min(count, int(pool.sum().item()))
+        if count <= 0:
+            return []
+        victim_experts = torch.argsort(masked_scores)[:count]
+        return [int(self.expert_to_slot[v].item()) for v in victim_experts.tolist()]
+
 
 class HybriMoECache:
     """Process-wide expert cache for all HybriMoE MoE layers."""
@@ -204,23 +219,52 @@ class HybriMoECache:
             del state.in_flight[expert]
         return events
 
-    def ensure_resident(self, state: HybriMoELayerState, experts: list[int]) -> list:
-        """Prefill path: make every expert in `experts` NPU-resident.
+    def enqueue_transfers(
+        self,
+        state: HybriMoELayerState,
+        experts: list[int],
+        protected: set[int],
+        stream,
+    ) -> None:
+        """Batch version of enqueue_transfer with vectorized victim selection.
 
-        Returns the events to wait on. Eviction protects the activated set so
-        the current layer forward never evicts an expert it still needs
-        (unless the activated set exceeds the slot count).
+        All copies share one completion event (they are stream-ordered anyway);
+        consumers must call collect_transfer_events() before using the experts.
         """
-        protected = set(experts)
-        events = []
-        for expert in experts:
-            if state.is_resident(expert) and expert not in state.in_flight:
-                state.hits += 1
-                continue
-            event = self.enqueue_transfer(state, expert, protected, self.copy_stream)
-            if event is not None:
-                events.append(event)
-        return events
+        misses = [e for e in experts if e not in state.in_flight and not state.is_resident(e)]
+        if not misses:
+            return
+        free = [s for s, e in enumerate(state.slot_to_expert) if e < 0]
+        if len(misses) > len(free):
+            victim_slots = state.select_victim_slots(len(misses) - len(free), protected)
+            for slot in victim_slots:
+                victim = state.slot_to_expert[slot]
+                if victim >= 0:
+                    state.expert_to_slot[victim] = -1
+                    state.slot_to_expert[slot] = -1
+                    stale = state.in_flight.pop(victim, None)
+                    if stale is not None:
+                        # The victim's slot is about to be overwritten on
+                        # `stream`; wait out its pending transfer first.
+                        stale[1].synchronize()
+            free.extend(victim_slots)
+
+        layer = state.layer
+        assignments = []
+        with torch.npu.stream(stream):
+            for expert, slot in zip(misses, free):
+                layer.w13_weight.data[slot].copy_(layer.host_w13_int8[expert], non_blocking=True)
+                layer.w2_weight.data[slot].copy_(layer.host_w2_int8[expert], non_blocking=True)
+                layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
+                layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
+                assignments.append((expert, slot))
+            event = stream.record_event()
+
+        for expert, slot in assignments:
+            state.slot_to_expert[slot] = expert
+            state.expert_to_slot[expert] = slot
+            state.in_flight[expert] = (slot, event)
+            state.misses += 1
 
     def hit_rate(self) -> float:
         hits = sum(s.hits for s in self.layers.values())
