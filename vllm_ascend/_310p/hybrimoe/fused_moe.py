@@ -42,6 +42,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch_npu
 from vllm.logger import logger
 
 from vllm_ascend._310p.fused_moe.experts_selector import select_experts
@@ -59,6 +60,7 @@ from vllm_ascend.ops.fused_moe.moe_stage_params import MoEQuantParams, MoERoutin
 from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
 from vllm_ascend.quantization.methods.base import AscendMoEScheme
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 
 def derive_num_slots(config, num_experts: int, hidden_size: int, intermediate_size: int, num_moe_layers: int) -> int:
@@ -155,11 +157,24 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             layer.dequant_host_weights()
 
         # Initial cache content: experts 0..num_slots-1 (all MRS scores are
-        # equal at this point, so the choice is arbitrary).
+        # equal at this point, so the choice is arbitrary). The slot weights
+        # are then cast to FRACTAL_NZ as one batch (the 310P quant grouped
+        # matmul is much slower on ND weights); incremental transfers cast
+        # per chunk and copy NZ blocks into individual slots.
         layer.w13_weight.data.copy_(layer.host_w13_int8[:num_slots])
         layer.w2_weight.data.copy_(layer.host_w2_int8[:num_slots])
         layer.w13_weight_scale.data.copy_(layer.host_w13_scale[:num_slots])
         layer.w2_weight_scale.data.copy_(layer.host_w2_scale[:num_slots])
+        if runtime.cache.use_nz_slots:
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            # One-time self-check that per-slot NZ updates are layout-safe;
+            # on failure the cache falls back to ND slots for all layers.
+            if not runtime.cache.nz_validated:
+                runtime.cache.nz_validated = True
+                if not runtime.cache.validate_nz_layout(layer):
+                    layer.w13_weight.data.copy_(layer.host_w13_int8[:num_slots])
+                    layer.w2_weight.data.copy_(layer.host_w2_int8[:num_slots])
 
         layer.create_hybrimoe_staging_buffers()
         state = runtime.cache.register_layer(layer, num_experts, num_slots)

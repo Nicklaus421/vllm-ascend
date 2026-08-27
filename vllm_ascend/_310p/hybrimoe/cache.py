@@ -33,7 +33,10 @@ maps and the in-flight table consistent.
 from __future__ import annotations
 
 import torch
+import torch_npu
 from vllm.logger import logger
+
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 from .config import HybriMoEConfig
 
@@ -41,6 +44,10 @@ from .config import HybriMoEConfig
 # routing weight is zeroed, so the sentinel slot's compute contributes
 # exactly nothing to the combined output.
 SENTINEL_SLOT = 0
+
+# Number of experts processed per H2D -> NZ-cast -> slot-copy chunk; bounds
+# the ND staging memory to a few hundred MB.
+_STAGING_ROWS = 32
 
 
 class HybriMoELayerState:
@@ -134,6 +141,12 @@ class HybriMoECache:
         self.layers: dict[str, HybriMoELayerState] = {}
         self._copy_stream = None
         self._prefetch_stream = None
+        self._staging_copy = None
+        self._staging_prefetch = None
+        # Whether slot weights are kept in FRACTAL_NZ format (validated once
+        # at startup; falls back to ND on failure).
+        self.use_nz_slots = True
+        self.nz_validated = False
 
     # ------------------------------------------------------------------
     # Streams (created lazily so importing this module never touches NPU).
@@ -165,34 +178,65 @@ class HybriMoECache:
     # ------------------------------------------------------------------
     # Batched DMA (aclrtMemcpyBatchAsync via swap_blocks_batch)
     # ------------------------------------------------------------------
-    def _get_batch_params(self, state: HybriMoELayerState):
-        """Per-layer batched-transfer descriptors, built once (or None if the
-        batched op is unavailable in this build)."""
-        if state.batch_params is not None:
-            return state.batch_params
+    def _get_staging(self, layer: torch.nn.Module, prefetch: bool):
+        """ND staging rows for the H2D->NZ-cast->slot-copy transfer pipeline.
+
+        One pair per stream (copy / prefetch) so transfers on the two streams
+        never share staging rows.
+        """
+        attr = "_staging_prefetch" if prefetch else "_staging_copy"
+        staging = getattr(self, attr, None)
+        if staging is None:
+            staging = (
+                torch.empty(_STAGING_ROWS, *layer.host_w13_int8.shape[1:], dtype=torch.int8, device="npu"),
+                torch.empty(_STAGING_ROWS, *layer.host_w2_int8.shape[1:], dtype=torch.int8, device="npu"),
+            )
+            setattr(self, attr, staging)
+        return staging
+
+    def _get_batch_params(self, state: HybriMoELayerState, prefetch: bool):
+        """Batched-DMA descriptors for weight H2D into ND staging rows.
+
+        Scales are copied per expert (they are tiny); only the two weight
+        matrices go through the batched path. Returns None when unavailable.
+        """
+        key = "batch_params_prefetch" if prefetch else "batch_params_copy"
+        params = getattr(state, key, None)
+        if params is not None:
+            return params or None
         try:
             from vllm_ascend.simple_kv_offload.npu_mem_ops import DIRECTION_H2D, build_params
 
             layer = state.layer
-            src = {
-                "w13": layer.host_w13_int8,
-                "w2": layer.host_w2_int8,
-                "s13": layer.host_w13_scale,
-                "s2": layer.host_w2_scale,
-            }
-            dst = {
-                "w13": layer.w13_weight.data,
-                "w2": layer.w2_weight.data,
-                "s13": layer.w13_weight_scale.data,
-                "s2": layer.w2_weight_scale.data,
-            }
-            state.batch_params = build_params(src, dst, DIRECTION_H2D)
+            staging13, staging2 = self._get_staging(layer, prefetch)
+            src = {"w13": layer.host_w13_int8, "w2": layer.host_w2_int8}
+            dst = {"w13": staging13, "w2": staging2}
+            params = build_params(src, dst, DIRECTION_H2D)
         except Exception:  # noqa: BLE001 - fall back to per-tensor copies
             logger.warning_once(
                 "HybriMoE: batched DMA (swap_blocks_batch) unavailable; falling back to per-tensor copies."
             )
-            state.batch_params = False
-        return state.batch_params
+            params = False
+        setattr(state, key, params)
+        return params or None
+
+    def validate_nz_layout(self, layer: torch.nn.Module) -> bool:
+        """Self-check of the batch-major NZ layout assumption (run once).
+
+        A single-expert NZ cast must byte-match slot 0 of the whole-stack NZ
+        cast; otherwise per-slot NZ updates would silently corrupt weights.
+        On mismatch the cache falls back to ND slots (correct, slower).
+        """
+        probe = layer.host_w13_int8[0:1].npu()
+        probe_nz = torch_npu.npu_format_cast(probe, ACL_FORMAT_FRACTAL_NZ)
+        ok = bool(torch.equal(probe_nz[0], layer.w13_weight.data[0]))
+        self.use_nz_slots = ok
+        if not ok:
+            logger.warning(
+                "HybriMoE: per-slot NZ layout validation failed; falling back to ND slot weights "
+                "(MoE grouped matmul will be slower)."
+            )
+        return ok
 
     # ------------------------------------------------------------------
     # Residency management
@@ -230,12 +274,8 @@ class HybriMoECache:
                 # device instead of blocking the host.
                 stream.wait_event(stale[1])
 
-        layer = state.layer
+        self._copy_experts_to_slots(state, [(expert, slot)], stream, prefetch=True)
         with torch.npu.stream(stream):
-            layer.w13_weight.data[slot].copy_(layer.host_w13_int8[expert], non_blocking=True)
-            layer.w2_weight.data[slot].copy_(layer.host_w2_int8[expert], non_blocking=True)
-            layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
-            layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
             event = stream.record_event()
 
         state.slot_to_expert[slot] = expert
@@ -287,22 +327,10 @@ class HybriMoECache:
                         stream.wait_event(stale[1])
             free.extend(victim_slots)
 
-        layer = state.layer
         assignments = list(zip(misses, free))
-        batch_params = self._get_batch_params(state)
+        self._copy_experts_to_slots(state, assignments, stream, prefetch=False)
+        event = None
         with torch.npu.stream(stream):
-            if batch_params:
-                # One batched DMA call per weight component (4 total)
-                # instead of 4 copy ops per expert.
-                from vllm_ascend.simple_kv_offload.npu_mem_ops import copy_blocks
-
-                copy_blocks(misses, [slot for _, slot in assignments], batch_params)
-            else:
-                for expert, slot in assignments:
-                    layer.w13_weight.data[slot].copy_(layer.host_w13_int8[expert], non_blocking=True)
-                    layer.w2_weight.data[slot].copy_(layer.host_w2_int8[expert], non_blocking=True)
-                    layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
-                    layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
             event = stream.record_event()
 
         for expert, slot in assignments:
@@ -310,6 +338,52 @@ class HybriMoECache:
             state.expert_to_slot[expert] = slot
             state.in_flight[expert] = (slot, event)
             state.misses += 1
+
+    def _copy_experts_to_slots(
+        self,
+        state: HybriMoELayerState,
+        assignments: list[tuple[int, int]],
+        stream,
+        prefetch: bool,
+    ) -> None:
+        """Transfer expert weights host -> NPU slots in NZ format.
+
+        Pipeline per chunk: batched H2D of the ND weights into staging rows,
+        one batched npu_format_cast, then per-slot NZ block copies; scales are
+        copied directly (no NZ). Falls back to plain per-expert ND copies when
+        NZ slots are disabled by layout validation.
+        """
+        layer = state.layer
+        use_nz = self.use_nz_slots
+        batch_params = self._get_batch_params(state, prefetch) if use_nz else None
+        staging13, staging2 = self._get_staging(layer, prefetch) if use_nz else (None, None)
+        with torch.npu.stream(stream):
+            for start in range(0, len(assignments), _STAGING_ROWS):
+                chunk = assignments[start : start + _STAGING_ROWS]
+                n = len(chunk)
+                if use_nz:
+                    experts = [expert for expert, _ in chunk]
+                    if batch_params is not None:
+                        from vllm_ascend.simple_kv_offload.npu_mem_ops import copy_blocks
+
+                        copy_blocks(experts, list(range(n)), batch_params)
+                    else:
+                        for i, expert in enumerate(experts):
+                            staging13[i].copy_(layer.host_w13_int8[expert], non_blocking=True)
+                            staging2[i].copy_(layer.host_w2_int8[expert], non_blocking=True)
+                    nz13 = torch_npu.npu_format_cast(staging13[:n], ACL_FORMAT_FRACTAL_NZ)
+                    nz2 = torch_npu.npu_format_cast(staging2[:n], ACL_FORMAT_FRACTAL_NZ)
+                    for i, (expert, slot) in enumerate(chunk):
+                        layer.w13_weight.data[slot].copy_(nz13[i])
+                        layer.w2_weight.data[slot].copy_(nz2[i])
+                        layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
+                        layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
+                else:
+                    for expert, slot in chunk:
+                        layer.w13_weight.data[slot].copy_(layer.host_w13_int8[expert], non_blocking=True)
+                        layer.w2_weight.data[slot].copy_(layer.host_w2_int8[expert], non_blocking=True)
+                        layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
+                        layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
 
     def hit_rate(self) -> float:
         hits = sum(s.hits for s in self.layers.values())
