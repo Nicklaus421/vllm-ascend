@@ -205,6 +205,9 @@ class HybriMoECache:
         if params is not None:
             return params or None
         try:
+            # The batched op requires a CANN build with aclrtMemcpyBatchAsync;
+            # probe it explicitly (build_params itself never fails).
+            _ = torch.ops._C_ascend.swap_blocks_batch
             from vllm_ascend.simple_kv_offload.npu_mem_ops import DIRECTION_H2D, build_params
 
             layer = state.layer
