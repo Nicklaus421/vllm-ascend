@@ -65,6 +65,8 @@ class ImpactDrivenPrefetcher:
         self.cost_model = cost_model
         self.lookahead = config.prefetch_lookahead
         self.prefetch_size = config.prefetch_size
+        self.interval = config.prefetch_interval
+        self._call_count = 0
         # Ring of pinned prediction buffers (lazily allocated), indexed by
         # target layer position % lookahead.
         self._pred_buffers: list[torch.Tensor | None] = [None] * self.lookahead
@@ -79,6 +81,9 @@ class ImpactDrivenPrefetcher:
         scoring_func: str,
         prefill: bool = False,
     ) -> None:
+        self._call_count += 1
+        if self._call_count % self.interval != 0:
+            return
         position = self.registry.position_of(state.layer_name)
         num_tokens = x.shape[0]
 

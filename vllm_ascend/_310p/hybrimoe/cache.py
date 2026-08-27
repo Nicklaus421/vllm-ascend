@@ -188,9 +188,10 @@ class HybriMoECache:
             state.slot_to_expert[slot] = -1
             stale = state.in_flight.pop(victim, None)
             if stale is not None:
-                # The victim's transfer finished or is irrelevant now; the
-                # slot copy below is stream-ordered after it anyway.
-                stale[1].synchronize()
+                # The victim's slot is about to be overwritten on `stream`;
+                # order the overwrite after the victim's pending transfer on
+                # device instead of blocking the host.
+                stream.wait_event(stale[1])
 
         layer = state.layer
         with torch.npu.stream(stream):
@@ -244,9 +245,9 @@ class HybriMoECache:
                     state.slot_to_expert[slot] = -1
                     stale = state.in_flight.pop(victim, None)
                     if stale is not None:
-                        # The victim's slot is about to be overwritten on
-                        # `stream`; wait out its pending transfer first.
-                        stale[1].synchronize()
+                        # Order the slot overwrite after the victim's pending
+                        # transfer on device instead of blocking the host.
+                        stream.wait_event(stale[1])
             free.extend(victim_slots)
 
         layer = state.layer

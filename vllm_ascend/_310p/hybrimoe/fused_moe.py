@@ -421,8 +421,10 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         t_total = t0
 
         # --- Async D2H of hidden states + routing pack; one host sync. ---
-        in_buf = executor.in_buffer(buffer_index)
-        in_buf[:num_tokens].copy_(x, non_blocking=True)
+        # The hidden states are only consumed by the CPU experts.
+        if runtime.config.enable_cpu_experts:
+            in_buf = executor.in_buffer(buffer_index)
+            in_buf[:num_tokens].copy_(x, non_blocking=True)
         flat_ids_pin = layer.pin_topk_ids[: num_tokens * top_k]
         flat_ids_pin.copy_(topk_ids.view(-1), non_blocking=True)
         flat_w_pin = layer.pin_topk_w[: num_tokens * top_k]
@@ -435,12 +437,19 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             runtime.record_phase("decode.d2h_sync", t0)
             t0 = time.perf_counter()
 
-        self._mrs_update(runtime, state, layer, num_tokens)
-
         # --- HSS scheduling decision (host). ---
         flat_ids = flat_ids_pin
-        counts_tensor = torch.bincount(flat_ids, minlength=num_experts)
+        counts_tensor = torch.bincount(flat_ids, minlength=state.num_experts)
         activated = torch.nonzero(counts_tensor).flatten().tolist()
+        if not runtime.config.enable_cpu_experts and len(activated) > state.num_slots:
+            # Without a CPU fallback, an over-large activated set cannot be
+            # handled by the slot cache alone; stream this layer in waves.
+            return self._streaming_forward(
+                runtime, state, layer, x, topk_ids, topk_weights, router_logits, scoring_func
+            )
+
+        self._mrs_update(runtime, state, layer, num_tokens)
+
         counts = {e: int(counts_tensor[e].item()) for e in activated}
         resident = state.expert_to_slot.tolist()
         in_flight = set(state.in_flight)
@@ -448,6 +457,13 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         uncached = [e for e in activated if resident[e] < 0 and e not in in_flight]
         result = hss_schedule(cached, uncached, counts, runtime.cost_model)
         cpu_expert_set = set(result.cpu_experts)
+        if not runtime.config.enable_cpu_experts:
+            # The CPU is slower than a transfer on this machine: every
+            # activated expert is computed on the NPU; uncached ones are
+            # transferred instead.
+            result.npu_experts.extend(result.cpu_experts)
+            result.cpu_experts = []
+            cpu_expert_set = set()
         if timing:
             runtime.record_phase("decode.sched", t0)
             t0 = time.perf_counter()
@@ -463,13 +479,12 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         evictable = sum(1 for e, s in enumerate(resident) if s >= 0 and e not in protected)
         capacity = (state.num_slots - n_resident) + evictable
         if len(to_move) > capacity:
-            overflow = set(to_move[capacity:])
-            result.npu_experts = [e for e in result.npu_experts if e not in overflow]
-            result.cpu_experts.extend(to_move[capacity:])
+            overflow = to_move[capacity:]
+            result.npu_experts = [e for e in result.npu_experts if e not in set(overflow)]
+            result.cpu_experts.extend(overflow)
             cpu_expert_set = set(result.cpu_experts)
             to_move = to_move[:capacity]
-        for expert in to_move:
-            cache.enqueue_transfer(state, expert, protected, cache.copy_stream)
+        cache.enqueue_transfers(state, to_move, protected, cache.copy_stream)
         transfer_events = cache.collect_transfer_events(state, result.npu_experts)
 
         # --- Slot remap + zero-weight sentinel for CPU-bound pairs. ---

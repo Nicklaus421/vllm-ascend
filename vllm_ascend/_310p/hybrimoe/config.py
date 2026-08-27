@@ -63,6 +63,14 @@ class HybriMoEConfig:
         # params_dtype) on the host for CPU compute. False halves host memory
         # at the cost of on-the-fly dequant.
         self.host_store_bf16: bool = bool(config.get("host_store_bf16", True))
+        # Allow the HSS scheduler to assign experts to CPU compute. On hosts
+        # whose CPU is slower than an H2D transfer (e.g. 310P boards with weak
+        # host CPUs), disabling this is strictly faster: uncached experts are
+        # always transferred to the NPU instead.
+        self.enable_cpu_experts: bool = bool(config.get("enable_cpu_experts", True))
+        # Run the impact-driven prefetcher only every N forwards (predictions
+        # stay valid across steps; the host-side simulation is not free).
+        self.prefetch_interval: int = int(config.get("prefetch_interval", 1))
         # Pin the (multi-GB) int8 host weight buffers for async H2D. On hosts
         # with ample RAM this is strongly recommended: pageable copies block
         # the host per expert and are far slower. Disable only if the 310P
@@ -98,6 +106,8 @@ class HybriMoEConfig:
             raise ValueError(f"hybrimoe_config.prefetch_lookahead must be >= 0, got {self.prefetch_lookahead}")
         if self.prefetch_size < 0:
             raise ValueError(f"hybrimoe_config.prefetch_size must be >= 0, got {self.prefetch_size}")
+        if self.prefetch_interval < 1:
+            raise ValueError(f"hybrimoe_config.prefetch_interval must be >= 1, got {self.prefetch_interval}")
         if self.num_cpu_threads < 0:
             raise ValueError(f"hybrimoe_config.num_cpu_threads must be >= 0, got {self.num_cpu_threads}")
         if self.decode_token_threshold < 1:
