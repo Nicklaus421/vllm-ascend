@@ -64,6 +64,11 @@ class HybriMoELayerState:
         # Slot-granularity token dispatcher (num_experts == num_slots), set by
         # the scheme after weight loading.
         self.dispatcher = None
+        # Top-1 dispatcher for the wave-streaming (prefill) path.
+        self.dispatcher_top1 = None
+        # Pre-computed batched-DMA descriptors (swap_blocks_batch), built
+        # lazily on first transfer.
+        self.batch_params = None
         # Cache telemetry.
         self.hits = 0
         self.misses = 0
@@ -156,6 +161,38 @@ class HybriMoECache:
 
     def get_layer(self, layer_name: str) -> HybriMoELayerState:
         return self.layers[layer_name]
+
+    # ------------------------------------------------------------------
+    # Batched DMA (aclrtMemcpyBatchAsync via swap_blocks_batch)
+    # ------------------------------------------------------------------
+    def _get_batch_params(self, state: HybriMoELayerState):
+        """Per-layer batched-transfer descriptors, built once (or None if the
+        batched op is unavailable in this build)."""
+        if state.batch_params is not None:
+            return state.batch_params
+        try:
+            from vllm_ascend.simple_kv_offload.npu_mem_ops import DIRECTION_H2D, build_params
+
+            layer = state.layer
+            src = {
+                "w13": layer.host_w13_int8,
+                "w2": layer.host_w2_int8,
+                "s13": layer.host_w13_scale,
+                "s2": layer.host_w2_scale,
+            }
+            dst = {
+                "w13": layer.w13_weight.data,
+                "w2": layer.w2_weight.data,
+                "s13": layer.w13_weight_scale.data,
+                "s2": layer.w2_weight_scale.data,
+            }
+            state.batch_params = build_params(src, dst, DIRECTION_H2D)
+        except Exception:  # noqa: BLE001 - fall back to per-tensor copies
+            logger.warning_once(
+                "HybriMoE: batched DMA (swap_blocks_batch) unavailable; falling back to per-tensor copies."
+            )
+            state.batch_params = False
+        return state.batch_params
 
     # ------------------------------------------------------------------
     # Residency management
@@ -251,14 +288,21 @@ class HybriMoECache:
             free.extend(victim_slots)
 
         layer = state.layer
-        assignments = []
+        assignments = list(zip(misses, free))
+        batch_params = self._get_batch_params(state)
         with torch.npu.stream(stream):
-            for expert, slot in zip(misses, free):
-                layer.w13_weight.data[slot].copy_(layer.host_w13_int8[expert], non_blocking=True)
-                layer.w2_weight.data[slot].copy_(layer.host_w2_int8[expert], non_blocking=True)
-                layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
-                layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
-                assignments.append((expert, slot))
+            if batch_params:
+                # One batched DMA call per weight component (4 total)
+                # instead of 4 copy ops per expert.
+                from vllm_ascend.simple_kv_offload.npu_mem_ops import copy_blocks
+
+                copy_blocks(misses, [slot for _, slot in assignments], batch_params)
+            else:
+                for expert, slot in assignments:
+                    layer.w13_weight.data[slot].copy_(layer.host_w13_int8[expert], non_blocking=True)
+                    layer.w2_weight.data[slot].copy_(layer.host_w2_int8[expert], non_blocking=True)
+                    layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
+                    layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
             event = stream.record_event()
 
         for expert, slot in assignments:

@@ -61,7 +61,12 @@ class HybriMoERuntime:
         if self._phase_calls % log_every != 0:
             return
         message = ", ".join(f"{name}={total / log_every:.3f}ms" for name, total in sorted(self._phase_stats.items()))
-        logger.info("HybriMoE phase timings (avg over %d layer calls): %s", log_every, message)
+        logger.info(
+            "HybriMoE phase timings (avg over %d layer calls): %s | expert cache hit rate: %.3f",
+            log_every,
+            message,
+            self.cache.hit_rate(),
+        )
         self._phase_stats.clear()
 
     @classmethod
@@ -130,14 +135,23 @@ class HybriMoERuntime:
             + first_layer.w13_weight_scale.data[0].nbytes
             + first_layer.w2_weight_scale.data[0].nbytes
         )
+        total_slot_gib = bytes_per_slot * num_slots * num_moe_layers / float(2**30)
         logger.info(
             "HybriMoE initialized: %d MoE layers, %d experts/layer, %d NPU slots/layer "
             "(NPU expert cache total: %.2f GiB)",
             num_moe_layers,
             self.cache.get_layer(self.registry.layer_names[0]).num_experts,
             num_slots,
-            bytes_per_slot * num_slots * num_moe_layers / float(2**30),
+            total_slot_gib,
         )
+        if self.config.npu_cache_slots_per_layer is None and total_slot_gib < 0.6 * self.config.npu_cache_budget_gb:
+            logger.warning(
+                "HybriMoE slot cache (%.2f GiB) uses less than 60%% of npu_cache_budget_gb (%.2f GiB); "
+                "the budget was spread over a wrong MoE layer count. Set "
+                "hybrimoe_config.npu_cache_slots_per_layer explicitly for the intended cache ratio.",
+                total_slot_gib,
+                self.config.npu_cache_budget_gb,
+            )
 
     # ------------------------------------------------------------------
     # Cost-model calibration on the actual machine
