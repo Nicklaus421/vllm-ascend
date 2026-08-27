@@ -470,6 +470,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         in_flight = set(state.in_flight)
         cached = [e for e in activated if resident[e] >= 0 or e in in_flight]
         uncached = [e for e in activated if resident[e] < 0 and e not in in_flight]
+        state.hits += len(cached)
         result = hss_schedule(cached, uncached, counts, runtime.cost_model)
         cpu_expert_set = set(result.cpu_experts)
         if not runtime.config.enable_cpu_experts:

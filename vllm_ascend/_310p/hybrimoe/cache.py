@@ -147,6 +147,7 @@ class HybriMoECache:
         # at startup; falls back to ND on failure).
         self.use_nz_slots = True
         self.nz_validated = False
+        self._foreach_copy_ok = None
 
     # ------------------------------------------------------------------
     # Streams (created lazily so importing this module never touches NPU).
@@ -250,11 +251,13 @@ class HybriMoECache:
         expert: int,
         protected: set[int],
         stream,
+        count_miss: bool = True,
     ):
         """Enqueue an H2D transfer of `expert` into an NPU slot.
 
         Returns the completion event of the transfer, or None if the expert
-        is already resident (and not still in flight).
+        is already resident (and not still in flight). `count_miss` is False
+        for prefetch fills (they are not demand misses).
         """
         pending = state.in_flight.get(expert)
         if pending is not None:
@@ -284,7 +287,8 @@ class HybriMoECache:
         state.slot_to_expert[slot] = expert
         state.expert_to_slot[expert] = slot
         state.in_flight[expert] = (slot, event)
-        state.misses += 1
+        if count_miss:
+            state.misses += 1
         return event
 
     def collect_transfer_events(self, state: HybriMoELayerState, experts: list[int]) -> list:
@@ -306,6 +310,7 @@ class HybriMoECache:
         experts: list[int],
         protected: set[int],
         stream,
+        count_miss: bool = True,
     ) -> None:
         """Batch version of enqueue_transfer with vectorized victim selection.
 
@@ -340,7 +345,8 @@ class HybriMoECache:
             state.slot_to_expert[slot] = expert
             state.expert_to_slot[expert] = slot
             state.in_flight[expert] = (slot, event)
-            state.misses += 1
+        if count_miss:
+            state.misses += len(assignments)
 
     def _copy_experts_to_slots(
         self,
@@ -364,29 +370,63 @@ class HybriMoECache:
             for start in range(0, len(assignments), _STAGING_ROWS):
                 chunk = assignments[start : start + _STAGING_ROWS]
                 n = len(chunk)
+                experts = [expert for expert, _ in chunk]
+                slots = [slot for _, slot in chunk]
                 if use_nz:
-                    experts = [expert for expert, _ in chunk]
                     if batch_params is not None:
                         from vllm_ascend.simple_kv_offload.npu_mem_ops import copy_blocks
 
                         copy_blocks(experts, list(range(n)), batch_params)
                     else:
-                        for i, expert in enumerate(experts):
-                            staging13[i].copy_(layer.host_w13_int8[expert], non_blocking=True)
-                            staging2[i].copy_(layer.host_w2_int8[expert], non_blocking=True)
+                        self._foreach_copy(
+                            [staging13[i] for i in range(n)] + [staging2[i] for i in range(n)],
+                            [layer.host_w13_int8[e] for e in experts] + [layer.host_w2_int8[e] for e in experts],
+                        )
                     nz13 = torch_npu.npu_format_cast(staging13[:n], ACL_FORMAT_FRACTAL_NZ)
                     nz2 = torch_npu.npu_format_cast(staging2[:n], ACL_FORMAT_FRACTAL_NZ)
-                    for i, (expert, slot) in enumerate(chunk):
-                        layer.w13_weight.data[slot].copy_(nz13[i])
-                        layer.w2_weight.data[slot].copy_(nz2[i])
-                        layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
-                        layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
+                    self._foreach_copy(
+                        [layer.w13_weight.data[s] for s in slots]
+                        + [layer.w2_weight.data[s] for s in slots]
+                        + [layer.w13_weight_scale.data[s] for s in slots]
+                        + [layer.w2_weight_scale.data[s] for s in slots],
+                        list(nz13.unbind(0))
+                        + list(nz2.unbind(0))
+                        + [layer.host_w13_scale[e] for e in experts]
+                        + [layer.host_w2_scale[e] for e in experts],
+                    )
                 else:
-                    for expert, slot in chunk:
-                        layer.w13_weight.data[slot].copy_(layer.host_w13_int8[expert], non_blocking=True)
-                        layer.w2_weight.data[slot].copy_(layer.host_w2_int8[expert], non_blocking=True)
-                        layer.w13_weight_scale.data[slot].copy_(layer.host_w13_scale[expert], non_blocking=True)
-                        layer.w2_weight_scale.data[slot].copy_(layer.host_w2_scale[expert], non_blocking=True)
+                    self._foreach_copy(
+                        [layer.w13_weight.data[s] for s in slots]
+                        + [layer.w2_weight.data[s] for s in slots]
+                        + [layer.w13_weight_scale.data[s] for s in slots]
+                        + [layer.w2_weight_scale.data[s] for s in slots],
+                        [layer.host_w13_int8[e] for e in experts]
+                        + [layer.host_w2_int8[e] for e in experts]
+                        + [layer.host_w13_scale[e] for e in experts]
+                        + [layer.host_w2_scale[e] for e in experts],
+                    )
+
+    def _foreach_copy(self, dsts: list[torch.Tensor], srcs: list[torch.Tensor]) -> None:
+        """Batched copy via torch._foreach_copy_ (one op for the whole list).
+
+        Falls back to a plain loop when the foreach op is unsupported, so
+        transfers cost O(1) op launches instead of O(len(dsts)) whenever
+        possible.
+        """
+        if not dsts:
+            return
+        if self._foreach_copy_ok is None:
+            try:
+                torch._foreach_copy_(dsts[:1], srcs[:1], non_blocking=True)
+                self._foreach_copy_ok = True
+            except Exception:  # noqa: BLE001
+                self._foreach_copy_ok = False
+                logger.warning_once("HybriMoE: torch._foreach_copy_ unavailable; using per-tensor copies.")
+        if self._foreach_copy_ok:
+            torch._foreach_copy_(dsts, srcs, non_blocking=True)
+        else:
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src, non_blocking=True)
 
     def hit_rate(self) -> float:
         hits = sum(s.hits for s in self.layers.values())

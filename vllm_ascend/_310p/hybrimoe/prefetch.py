@@ -160,7 +160,7 @@ class ImpactDrivenPrefetcher:
         protected = set(activated) | in_flight
         issued = 0
         for expert in selected:
-            self.cache.enqueue_transfer(next_state, expert, protected, self.cache.prefetch_stream)
+            self.cache.enqueue_transfer(next_state, expert, protected, self.cache.prefetch_stream, count_miss=False)
             issued += 1
         if issued:
             logger.debug(
