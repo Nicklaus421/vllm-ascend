@@ -160,7 +160,10 @@ class ImpactDrivenPrefetcher:
         protected = set(activated) | in_flight
         issued = 0
         for expert in selected:
-            self.cache.enqueue_transfer(next_state, expert, protected, self.cache.prefetch_stream, count_miss=False)
+            # All transfers share the single copy stream: the residency-mirror
+            # writes are stream-ordered with the weights, avoiding cross-stream
+            # races on the device-side map.
+            self.cache.enqueue_transfer(next_state, expert, protected, self.cache.copy_stream, count_miss=False)
             issued += 1
         if issued:
             logger.debug(

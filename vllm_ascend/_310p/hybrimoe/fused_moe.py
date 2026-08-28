@@ -181,6 +181,10 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         for slot in range(num_slots):
             state.slot_to_expert[slot] = slot
             state.expert_to_slot[slot] = slot
+        # NPU residency mirror for the pipelined decode path.
+        mirror = torch.full((num_experts,), -1, dtype=torch.int32, device="cpu")
+        mirror[:num_slots] = torch.arange(num_slots, dtype=torch.int32)
+        state.dev_expert_to_slot = mirror.npu()
         state.dispatcher = TokenDispatcherWithAllGather310(
             top_k=layer.top_k,
             num_experts=num_slots,
@@ -258,6 +262,10 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         # argument is never set by the 310P forward path.
         if num_tokens > runtime.config.decode_token_threshold:
             out = self._streaming_forward(runtime, state, layer, x, topk_ids, topk_weights, router_logits, scoring_func)
+        elif runtime.config.pipelined_decode:
+            out = self._pipelined_decode_forward(
+                runtime, state, layer, x, topk_ids, topk_weights, router_logits, top_k, scoring_func
+            )
         else:
             out = self._decode_forward(
                 runtime, state, layer, x, topk_ids, topk_weights, router_logits, top_k, scoring_func
@@ -350,51 +358,14 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             wave_member = torch.zeros(state.num_experts, dtype=torch.bool)
             wave_member[wave] = True
             positions = torch.nonzero(wave_member[flat_ids]).flatten()
-            n = positions.numel()
             sel_tokens = pair_tokens[positions]
             sel_slots = state.expert_to_slot[flat_ids[positions]].to(torch.int32)
             sel_weights = flat_w_pin[positions]
-
-            copy_stream = cache.copy_stream
-            with torch.npu.stream(copy_stream):
-                layer.dev_topk_ids[:n].copy_(sel_slots, non_blocking=True)
-                layer.dev_topk_w[:n].copy_(sel_weights, non_blocking=True)
-                layer.dev_pair_tokens[:n].copy_(sel_tokens, non_blocking=True)
-                ready_event = copy_stream.record_event()
-            main_stream.wait_event(ready_event)
-            for event in events:
-                main_stream.wait_event(event)
             if timing:
                 runtime.record_phase("stream.wave_host", t_wave)
                 t_wave = time.perf_counter()
 
-            sel_tokens_npu = layer.dev_pair_tokens[:n]
-            x_wave = x.index_select(0, sel_tokens_npu)
-            dispatch_output = state.dispatcher_top1.token_dispatch(
-                MoETokenDispatchInput(
-                    hidden_states=x_wave,
-                    topk_weights=layer.dev_topk_w[:n].view(n, 1),
-                    topk_ids=layer.dev_topk_ids[:n].view(n, 1),
-                    routing=MoERoutingParams(
-                        expert_map=None,
-                        global_redundant_expert_num=0,
-                        mc2_mask=None,
-                        apply_router_weight_on_input=False,
-                    ),
-                    quant=MoEQuantParams(quant_type=QuantType.W8A8),
-                )
-            )
-            mlp_out = quant_apply_mlp(
-                hidden_states=dispatch_output.hidden_states,
-                w1=layer.w13_weight,
-                w1_scale=layer.w13_weight_scale,
-                w2=layer.w2_weight,
-                w2_scale=layer.w2_weight_scale,
-                group_list=dispatch_output.group_list,
-                group_list_type=dispatch_output.group_list_type,
-            )
-            wave_out = state.dispatcher_top1.token_combine(mlp_out, dispatch_output.combine_metadata)
-            out.index_add_(0, sel_tokens_npu, wave_out)
+            self._compact_top1_forward(state, layer, x, sel_tokens, sel_slots, sel_weights, out, events)
             if timing:
                 runtime.record_phase("stream.wave_npu", t_wave)
 
@@ -413,6 +384,127 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
     # ------------------------------------------------------------------
     # Decode: HSS hybrid CPU/NPU scheduling.
     # ------------------------------------------------------------------
+    def _pipelined_decode_forward(
+        self,
+        runtime: HybriMoERuntime,
+        state: HybriMoELayerState,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        scoring_func: str,
+    ) -> torch.Tensor:
+        """Pipelined decode: the grouped matmul never waits for the host.
+
+        The slot remap runs on device (gather over the NPU residency mirror),
+        GMM is launched immediately, and the host D2H sync / MRS bookkeeping /
+        miss handling happen while the NPU computes. Missed experts are
+        computed by a second compact top-1 wave after their on-demand
+        transfers (or by the CPU when enable_cpu_experts is set).
+        """
+        cache = runtime.cache
+        num_tokens = x.shape[0]
+        main_stream = torch.npu.current_stream()
+        timing = runtime.config.profile_phases
+        t0 = time.perf_counter()
+        t_total = t0
+
+        # 1. Device-side slot remap; no host sync before the GMM.
+        slot_ids = state.dev_expert_to_slot[topk_ids]
+        miss_mask = slot_ids < 0
+        npu_ids = torch.where(miss_mask, SENTINEL_SLOT, slot_ids)
+        npu_w = torch.where(miss_mask, 0.0, topk_weights.to(x.dtype))
+        # Mirror/slot writes by later transfers must not race this gather.
+        remap_done = main_stream.record_event()
+
+        # 2. Wait in-flight transfers (host dict, no sync) and launch the GMM.
+        for event in cache.collect_all_transfer_events(state):
+            main_stream.wait_event(event)
+        out = self._npu_fused(state, layer, x, npu_ids, npu_w)
+        if timing:
+            runtime.record_phase("decode.gmm1_launch", t0)
+            t0 = time.perf_counter()
+
+        # 3. Async D2H pack; the host sync below overlaps the GMM on device.
+        flat_ids_pin = layer.pin_topk_ids[: num_tokens * top_k]
+        flat_ids_pin.copy_(topk_ids.view(-1), non_blocking=True)
+        flat_w_pin = layer.pin_topk_w[: num_tokens * top_k]
+        flat_w_pin.copy_(topk_weights.view(-1), non_blocking=True)
+        executor = None
+        buffer_index = -1
+        if runtime.config.enable_cpu_experts:
+            executor = runtime.get_executor(x.shape[1], dtype=layer.params_dtype)
+            buffer_index = executor.next_buffer()
+            executor.in_buffer(buffer_index)[:num_tokens].copy_(x, non_blocking=True)
+        top_p_scores, top_p_ids = _routing_scores(router_logits, scoring_func).topk(layer.hybrimoe_top_p, dim=-1)
+        layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
+        layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_scores.view(-1), non_blocking=True)
+        main_stream.record_event().synchronize()
+        if timing:
+            runtime.record_phase("decode.d2h_sync", t0)
+            t0 = time.perf_counter()
+
+        # 4. Host bookkeeping (overlaps the device work enqueued above).
+        self._mrs_update(runtime, state, layer, num_tokens)
+        flat_ids = flat_ids_pin
+        counts_tensor = torch.bincount(flat_ids, minlength=state.num_experts)
+        activated = torch.nonzero(counts_tensor).flatten().tolist()
+        resident = state.expert_to_slot.tolist()
+        in_flight = set(state.in_flight)
+        misses = [e for e in activated if resident[e] < 0 and e not in in_flight]
+        state.hits += len(activated) - len(misses)
+        state.misses += len(misses)
+
+        # 5. Missed experts: CPU (overlapped) or a second on-NPU wave.
+        cpu_handle = None
+        if misses:
+            cache.copy_stream.wait_event(remap_done)
+            if runtime.config.enable_cpu_experts:
+                is_miss = torch.zeros(state.num_experts, dtype=torch.bool)
+                is_miss[misses] = True
+                miss_mask_host = is_miss[flat_ids]
+                assignments = _build_cpu_assignments(flat_ids, flat_w_pin, miss_mask_host, misses, num_tokens, top_k)
+                cpu_handle = executor.submit(layer, assignments, buffer_index, num_tokens)
+            else:
+                pair_tokens = torch.arange(num_tokens).repeat_interleave(top_k)
+                for chunk_start in range(0, len(misses), state.num_slots):
+                    chunk = misses[chunk_start : chunk_start + state.num_slots]
+                    cache.enqueue_transfers(
+                        state, chunk, protected=set(activated), stream=cache.copy_stream, count_miss=False
+                    )
+                    events = cache.collect_transfer_events(state, chunk)
+                    is_chunk = torch.zeros(state.num_experts, dtype=torch.bool)
+                    is_chunk[chunk] = True
+                    positions = torch.nonzero(is_chunk[flat_ids]).flatten()
+                    sel_tokens = pair_tokens[positions]
+                    sel_slots = state.expert_to_slot[flat_ids[positions]].to(torch.int32)
+                    sel_weights = flat_w_pin[positions]
+                    self._compact_top1_forward(state, layer, x, sel_tokens, sel_slots, sel_weights, out, events)
+        if timing:
+            runtime.record_phase("decode.miss_handling", t0)
+            t0 = time.perf_counter()
+
+        # 6. Impact-driven prefetch for subsequent layers.
+        if runtime.prefetcher is not None:
+            runtime.prefetcher.maybe_prefetch(state, x, top_k, scoring_func, prefill=False)
+        if timing:
+            runtime.record_phase("decode.prefetch", t0)
+            t0 = time.perf_counter()
+
+        # 7. Combine the CPU partial result, if any.
+        if cpu_handle is not None:
+            h2d_event = cpu_handle.wait_and_h2d(cache.copy_stream, executor.consume_event(buffer_index))
+            main_stream.wait_event(h2d_event)
+            out = out + cpu_handle.out_npu[:num_tokens].to(out.dtype)
+            executor.mark_consumed(buffer_index, main_stream.record_event())
+        if timing:
+            runtime.record_phase("decode.cpu_wait_combine", t0)
+            runtime.record_phase("decode.total", t_total)
+            runtime.tick_phase_log()
+        return out
+
     def _decode_forward(
         self,
         runtime: HybriMoERuntime,
@@ -616,6 +708,69 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             group_list_type=dispatch_output.group_list_type,
         )
         return state.dispatcher.token_combine(mlp_out, dispatch_output.combine_metadata)
+
+    def _compact_top1_forward(
+        self,
+        state: HybriMoELayerState,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        sel_tokens: torch.Tensor,
+        sel_slots: torch.Tensor,
+        sel_weights: torch.Tensor,
+        out: torch.Tensor,
+        wait_events: list,
+    ) -> None:
+        """Compute a subset of (token, expert) pairs and accumulate into `out`.
+
+        sel_* are host tensors; each selected pair is dispatched as an
+        independent top-1 token, so the number of GMM rows equals exactly the
+        number of pairs (no sentinel waste). Buffer reuse across calls is
+        ordered by an event chain (state.last_compact_event).
+        """
+        n = sel_tokens.numel()
+        copy_stream = HybriMoERuntime.get().cache.copy_stream
+        main_stream = torch.npu.current_stream()
+        with torch.npu.stream(copy_stream):
+            if state.last_compact_event is not None:
+                # The previous compact forward may still be reading the shared
+                # dev buffers; order this H2D after it.
+                copy_stream.wait_event(state.last_compact_event)
+            layer.dev_topk_ids[:n].copy_(sel_slots, non_blocking=True)
+            layer.dev_topk_w[:n].copy_(sel_weights, non_blocking=True)
+            layer.dev_pair_tokens[:n].copy_(sel_tokens, non_blocking=True)
+            ready_event = copy_stream.record_event()
+        main_stream.wait_event(ready_event)
+        for event in wait_events:
+            main_stream.wait_event(event)
+
+        sel_tokens_npu = layer.dev_pair_tokens[:n]
+        x_sel = x.index_select(0, sel_tokens_npu)
+        dispatch_output = state.dispatcher_top1.token_dispatch(
+            MoETokenDispatchInput(
+                hidden_states=x_sel,
+                topk_weights=layer.dev_topk_w[:n].view(n, 1),
+                topk_ids=layer.dev_topk_ids[:n].view(n, 1),
+                routing=MoERoutingParams(
+                    expert_map=None,
+                    global_redundant_expert_num=0,
+                    mc2_mask=None,
+                    apply_router_weight_on_input=False,
+                ),
+                quant=MoEQuantParams(quant_type=QuantType.W8A8),
+            )
+        )
+        mlp_out = quant_apply_mlp(
+            hidden_states=dispatch_output.hidden_states,
+            w1=layer.w13_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2=layer.w2_weight,
+            w2_scale=layer.w2_weight_scale,
+            group_list=dispatch_output.group_list,
+            group_list_type=dispatch_output.group_list_type,
+        )
+        partial = state.dispatcher_top1.token_combine(mlp_out, dispatch_output.combine_metadata)
+        out.index_add_(0, sel_tokens_npu, partial)
+        state.last_compact_event = main_stream.record_event()
 
 
 def _routing_scores(router_logits: torch.Tensor, scoring_func: str) -> torch.Tensor:

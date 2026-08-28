@@ -73,6 +73,12 @@ class HybriMoELayerState:
         self.dispatcher = None
         # Top-1 dispatcher for the wave-streaming (prefill) path.
         self.dispatcher_top1 = None
+        # NPU mirror of expert_to_slot for the pipelined decode path (device
+        # side remap without a host sync). Updated on every slot mutation,
+        # stream-ordered after the corresponding weight transfer.
+        self.dev_expert_to_slot: torch.Tensor | None = None
+        # Event of the last compact top-1 forward; guards dev-buffer reuse.
+        self.last_compact_event = None
         # Pre-computed batched-DMA descriptors (swap_blocks_batch), built
         # lazily on first transfer.
         self.batch_params = None
@@ -280,16 +286,23 @@ class HybriMoECache:
                 # device instead of blocking the host.
                 stream.wait_event(stale[1])
 
-        self._copy_experts_to_slots(state, [(expert, slot)], stream, prefetch=True)
-        with torch.npu.stream(stream):
-            event = stream.record_event()
-
+        self._copy_experts_to_slots(state, [(expert, slot)], stream, prefetch=False)
         state.slot_to_expert[slot] = expert
         state.expert_to_slot[expert] = slot
+        with torch.npu.stream(stream):
+            self._write_mirror(state)
+            event = stream.record_event()
+
         state.in_flight[expert] = (slot, event)
         if count_miss:
             state.misses += 1
         return event
+
+    @staticmethod
+    def _write_mirror(state: HybriMoELayerState) -> None:
+        """Mirror the host residency map to the NPU (caller holds the stream)."""
+        if state.dev_expert_to_slot is not None:
+            state.dev_expert_to_slot.copy_(state.expert_to_slot, non_blocking=True)
 
     def collect_transfer_events(self, state: HybriMoELayerState, experts: list[int]) -> list:
         """Events the compute stream must wait on before using `experts`."""
@@ -337,16 +350,22 @@ class HybriMoECache:
 
         assignments = list(zip(misses, free))
         self._copy_experts_to_slots(state, assignments, stream, prefetch=False)
-        event = None
-        with torch.npu.stream(stream):
-            event = stream.record_event()
-
         for expert, slot in assignments:
             state.slot_to_expert[slot] = expert
             state.expert_to_slot[expert] = slot
+        with torch.npu.stream(stream):
+            self._write_mirror(state)
+            event = stream.record_event()
+        for expert, slot in assignments:
             state.in_flight[expert] = (slot, event)
         if count_miss:
             state.misses += len(assignments)
+
+    def collect_all_transfer_events(self, state: HybriMoELayerState) -> list:
+        """Pop every in-flight transfer event of this layer (pipelined decode)."""
+        events = [event for _, event in state.in_flight.values()]
+        state.in_flight.clear()
+        return events
 
     def _copy_experts_to_slots(
         self,

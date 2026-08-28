@@ -76,6 +76,11 @@ class HybriMoEConfig:
         # the host per expert and are far slower. Disable only if the 310P
         # driver rejects large registered-memory regions.
         self.pin_host_weights: bool = bool(config.get("pin_host_weights", True))
+        # Pipelined decode (default): the slot remap runs on device and the
+        # grouped matmul launches without waiting for the host; misses are
+        # computed by a second on-NPU wave (or the CPU when enable_cpu_experts
+        # is set). False selects the original HSS path (pre-GMM host sync).
+        self.pipelined_decode: bool = bool(config.get("pipelined_decode", True))
         # Per-phase host-side timing of the HybriMoE forward path, logged
         # periodically. For performance debugging only.
         self.profile_phases: bool = bool(config.get("profile_phases", False))
