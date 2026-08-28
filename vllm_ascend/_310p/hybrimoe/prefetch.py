@@ -134,9 +134,11 @@ class ImpactDrivenPrefetcher:
         if not uncached:
             return
 
-        if prefill:
-            # Prefill activates nearly every expert, so the gain simulation
-            # adds nothing; just prefetch the highest-load candidates.
+        if prefill or not self.config.enable_cpu_experts:
+            # Without a CPU queue in the schedule (prefill, or CPU experts
+            # disabled), the makespan gain of prefetching is essentially
+            # uniform across candidates; ordering by predicted load is enough
+            # and skips the host-side HSS simulations entirely.
             candidates = sorted(uncached, key=lambda e: counts[e], reverse=True)
             selected = candidates[: self.prefetch_size]
         else:

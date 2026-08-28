@@ -525,13 +525,20 @@ class NPUPlatform(Platform):
                 compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
         if ascend_config.hybrimoe_config.enabled:
-            logger.info(
-                "HybriMoE is enabled: forcing eager mode because the hybrid CPU-NPU "
-                "MoE forward contains host synchronization that cannot be graph-captured."
-            )
-            enforce_eager = True
-            model_config.enforce_eager = True
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            if ascend_config.hybrimoe_config.graph_mode == "piecewise":
+                # Experimental: keep non-MoE parts in piecewise aclgraphs; the
+                # hybrid CPU-NPU MoE forward (host syncs) is split out to eager.
+                logger.info("HybriMoE is enabled: using PIECEWISE cudagraph with MoE ops split out.")
+                compilation_config.mode = CompilationMode.VLLM_COMPILE
+                compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            else:
+                logger.info(
+                    "HybriMoE is enabled: forcing eager mode because the hybrid CPU-NPU "
+                    "MoE forward contains host synchronization that cannot be graph-captured."
+                )
+                enforce_eager = True
+                model_config.enforce_eager = True
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
         if enforce_eager:
             logger.info("Compilation disabled, using eager mode by default")
@@ -629,6 +636,15 @@ class NPUPlatform(Platform):
                     "vllm::dsa_forward",
                 ]
             )
+            if ascend_config.hybrimoe_config.enabled:
+                # The HybriMoE MoE forward contains host synchronization and
+                # CPU-thread work; keep it out of the captured graph segments.
+                compilation_config.splitting_ops.extend(
+                    [
+                        "vllm::moe_forward",
+                        "vllm::moe_forward_shared",
+                    ]
+                )
             # TODO(2026/7/15): Delete the reduced gear after the new driver is released.
             if get_ascend_device_type() == AscendDeviceType.A5:
                 prune_capture_sizes_for_950(vllm_config)

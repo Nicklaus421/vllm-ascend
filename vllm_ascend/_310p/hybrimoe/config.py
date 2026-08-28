@@ -81,6 +81,13 @@ class HybriMoEConfig:
         # computed by a second on-NPU wave (or the CPU when enable_cpu_experts
         # is set). False selects the original HSS path (pre-GMM host sync).
         self.pipelined_decode: bool = bool(config.get("pipelined_decode", True))
+        # Graph strategy with HybriMoE. "eager": force eager for the whole
+        # model (safe default; the MoE forward contains host syncs). "piecewise":
+        # experimental - capture non-MoE parts in piecewise aclgraphs with the
+        # MoE forward ops split out to eager.
+        self.graph_mode: str = str(config.get("graph_mode", "eager"))
+        if self.graph_mode not in ("eager", "piecewise"):
+            raise ValueError(f"hybrimoe_config.graph_mode must be 'eager' or 'piecewise', got {self.graph_mode}")
         # Per-phase host-side timing of the HybriMoE forward path, logged
         # periodically. For performance debugging only.
         self.profile_phases: bool = bool(config.get("profile_phases", False))
