@@ -185,6 +185,14 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         mirror = torch.full((num_experts,), -1, dtype=torch.int32, device="cpu")
         mirror[:num_slots] = torch.arange(num_slots, dtype=torch.int32)
         state.dev_expert_to_slot = mirror.npu()
+        # Frozen dispatch parameter objects reused on every forward.
+        state.routing_params = MoERoutingParams(
+            expert_map=None,
+            global_redundant_expert_num=0,
+            mc2_mask=None,
+            apply_router_weight_on_input=False,
+        )
+        state.quant_params = MoEQuantParams(quant_type=QuantType.W8A8)
         state.dispatcher = TokenDispatcherWithAllGather310(
             top_k=layer.top_k,
             num_experts=num_slots,
@@ -407,11 +415,31 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         cache = runtime.cache
         num_tokens = x.shape[0]
         main_stream = torch.npu.current_stream()
+        copy_stream = cache.copy_stream
         timing = runtime.config.profile_phases
         t0 = time.perf_counter()
         t_total = t0
 
-        # 1. Device-side slot remap; no host sync before the GMM.
+        # 1. Kick off the routing D2H pack on the copy stream, gated by the
+        # routing results on the main stream. It transfers concurrently with
+        # the remap + GMM below, so the host sync afterwards is nearly free.
+        top_p_scores, top_p_ids = _routing_scores(router_logits, scoring_func).topk(layer.hybrimoe_top_p, dim=-1)
+        routing_ready = main_stream.record_event()
+        copy_stream.wait_event(routing_ready)
+        with torch.npu.stream(copy_stream):
+            layer.pin_topk_ids[: num_tokens * top_k].copy_(topk_ids.view(-1), non_blocking=True)
+            layer.pin_topk_w[: num_tokens * top_k].copy_(topk_weights.view(-1), non_blocking=True)
+            executor = None
+            buffer_index = -1
+            if runtime.config.enable_cpu_experts:
+                executor = runtime.get_executor(x.shape[1], dtype=layer.params_dtype)
+                buffer_index = executor.next_buffer()
+                executor.in_buffer(buffer_index)[:num_tokens].copy_(x, non_blocking=True)
+            layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
+            layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_scores.view(-1), non_blocking=True)
+            pack_done = copy_stream.record_event()
+
+        # 2. Device-side slot remap; no host sync before the GMM.
         slot_ids = state.dev_expert_to_slot[topk_ids]
         miss_mask = slot_ids < 0
         npu_ids = torch.where(miss_mask, SENTINEL_SLOT, slot_ids)
@@ -419,7 +447,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         # Mirror/slot writes by later transfers must not race this gather.
         remap_done = main_stream.record_event()
 
-        # 2. Wait in-flight transfers (host dict, no sync) and launch the GMM.
+        # 3. Wait in-flight transfers (host dict, no sync) and launch the GMM.
         for event in cache.collect_all_transfer_events(state):
             main_stream.wait_event(event)
         out = self._npu_fused(state, layer, x, npu_ids, npu_w)
@@ -427,28 +455,17 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             runtime.record_phase("decode.gmm1_launch", t0)
             t0 = time.perf_counter()
 
-        # 3. Async D2H pack; the host sync below overlaps the GMM on device.
-        flat_ids_pin = layer.pin_topk_ids[: num_tokens * top_k]
-        flat_ids_pin.copy_(topk_ids.view(-1), non_blocking=True)
-        flat_w_pin = layer.pin_topk_w[: num_tokens * top_k]
-        flat_w_pin.copy_(topk_weights.view(-1), non_blocking=True)
-        executor = None
-        buffer_index = -1
-        if runtime.config.enable_cpu_experts:
-            executor = runtime.get_executor(x.shape[1], dtype=layer.params_dtype)
-            buffer_index = executor.next_buffer()
-            executor.in_buffer(buffer_index)[:num_tokens].copy_(x, non_blocking=True)
-        top_p_scores, top_p_ids = _routing_scores(router_logits, scoring_func).topk(layer.hybrimoe_top_p, dim=-1)
-        layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
-        layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_scores.view(-1), non_blocking=True)
-        main_stream.record_event().synchronize()
+        # 4. The routing pack has been transferring during remap+GMM launch;
+        # this sync should find it (nearly) complete.
+        pack_done.synchronize()
         if timing:
             runtime.record_phase("decode.d2h_sync", t0)
             t0 = time.perf_counter()
 
-        # 4. Host bookkeeping (overlaps the device work enqueued above).
+        # 5. Host bookkeeping (overlaps the device work enqueued above).
         self._mrs_update(runtime, state, layer, num_tokens)
-        flat_ids = flat_ids_pin
+        flat_ids = layer.pin_topk_ids[: num_tokens * top_k]
+        flat_w_pin = layer.pin_topk_w[: num_tokens * top_k]
         counts_tensor = torch.bincount(flat_ids, minlength=state.num_experts)
         activated = torch.nonzero(counts_tensor).flatten().tolist()
         resident = state.expert_to_slot.tolist()
@@ -457,7 +474,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         state.hits += len(activated) - len(misses)
         state.misses += len(misses)
 
-        # 5. Missed experts: CPU (overlapped) or a second on-NPU wave.
+        # 6. Missed experts: CPU (overlapped) or a second on-NPU wave.
         cpu_handle = None
         if misses:
             cache.copy_stream.wait_event(remap_done)
@@ -689,13 +706,8 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                 hidden_states=x,
                 topk_weights=npu_topk_weights,
                 topk_ids=npu_topk_ids,
-                routing=MoERoutingParams(
-                    expert_map=None,
-                    global_redundant_expert_num=0,
-                    mc2_mask=None,
-                    apply_router_weight_on_input=False,
-                ),
-                quant=MoEQuantParams(quant_type=QuantType.W8A8),
+                routing=state.routing_params,
+                quant=state.quant_params,
             )
         )
         mlp_out = quant_apply_mlp(
@@ -750,13 +762,8 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                 hidden_states=x_sel,
                 topk_weights=layer.dev_topk_w[:n].view(n, 1),
                 topk_ids=layer.dev_topk_ids[:n].view(n, 1),
-                routing=MoERoutingParams(
-                    expert_map=None,
-                    global_redundant_expert_num=0,
-                    mc2_mask=None,
-                    apply_router_weight_on_input=False,
-                ),
-                quant=MoEQuantParams(quant_type=QuantType.W8A8),
+                routing=state.routing_params,
+                quant=state.quant_params,
             )
         )
         mlp_out = quant_apply_mlp(

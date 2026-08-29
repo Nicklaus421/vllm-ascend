@@ -79,6 +79,10 @@ class HybriMoELayerState:
         self.dev_expert_to_slot: torch.Tensor | None = None
         # Event of the last compact top-1 forward; guards dev-buffer reuse.
         self.last_compact_event = None
+        # Frozen dispatch parameter objects (constant per layer; avoids
+        # re-allocating them on every forward).
+        self.routing_params = None
+        self.quant_params = None
         # Pre-computed batched-DMA descriptors (swap_blocks_batch), built
         # lazily on first transfer.
         self.batch_params = None
