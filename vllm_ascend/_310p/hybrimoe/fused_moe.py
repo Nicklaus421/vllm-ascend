@@ -825,6 +825,13 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # MTP drafter MoE layers stay fully NPU-resident on the standard 310P
+        # path: the drafter is a single small layer and offloading its experts
+        # would only add latency.
+        self.is_hybrimoe_drafter = "mtp" in self.layer_name.split(".")
+        if self.is_hybrimoe_drafter:
+            self.is_hybrimoe_layer = False
+            return
         if not isinstance(self.quant_method, AscendHybriMoEMethod):
             raise RuntimeError(
                 "HybriMoE requires the W8A8 (W8A8_DYNAMIC) ModelSlim quantization for MoE layers, "
@@ -875,6 +882,9 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        if self.is_hybrimoe_drafter:
+            # Drafter experts load into the full NPU parameters normally.
+            return super().weight_loader(param, loaded_weight, weight_name, shard_id, expert_id, return_success)
         # TP=1 / EP=1: the global expert id is the local one; no shard
         # splitting is needed beyond the w1/w3 halves of w13.
         weight = loaded_weight.detach().cpu()

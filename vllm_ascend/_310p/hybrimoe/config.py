@@ -140,8 +140,6 @@ class HybriMoEConfig:
             )
         if parallel_config.enable_expert_parallel:
             raise RuntimeError("HybriMoE does not support expert parallelism. Please remove --enable-expert-parallel.")
-        if vllm_config.speculative_config is not None:
-            raise RuntimeError("HybriMoE is not compatible with speculative decoding yet.")
 
 
 def hybrimoe_enabled_from_additional_config(additional_config: dict[str, Any] | None) -> bool:

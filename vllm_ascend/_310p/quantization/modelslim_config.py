@@ -137,7 +137,10 @@ class AscendModelSlimConfig310(AscendModelSlimConfig):
                 return AscendUnquantizedFusedMoEMethod310(layer.moe_config)
             from vllm_ascend.ascend_config import get_ascend_config
 
-            if get_ascend_config().hybrimoe_config.enabled:
+            if get_ascend_config().hybrimoe_config.enabled and "mtp" not in prefix.split("."):
+                # MTP drafter MoE layers (prefix contains ".mtp.") stay on the
+                # standard full-resident path below; only the main model's MoE
+                # layers are offloaded by HybriMoE.
                 quant_type = get_quant_type_for_layer(
                     self.quant_description, prefix, "moe", self.packed_modules_mapping
                 )
