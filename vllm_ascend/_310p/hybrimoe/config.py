@@ -22,6 +22,8 @@ imported from vllm_ascend.ascend_config on any platform.
 
 from typing import TYPE_CHECKING, Any
 
+from vllm.logger import logger
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -140,6 +142,27 @@ class HybriMoEConfig:
             )
         if parallel_config.enable_expert_parallel:
             raise RuntimeError("HybriMoE does not support expert parallelism. Please remove --enable-expert-parallel.")
+
+        # With speculative decoding the target model's decode (verify) step
+        # processes max_num_seqs * (1 + num_speculative_tokens) tokens. The
+        # default decode_token_threshold (32) would misroute such verify
+        # batches to the slow wave-streaming path, so raise the threshold to
+        # keep every verify batch on the pipelined decode path.
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None:
+            num_spec_tokens = getattr(spec_config, "num_speculative_tokens", 0) or 0
+            max_decode_tokens = vllm_config.scheduler_config.max_num_seqs * (1 + num_spec_tokens)
+            if self.decode_token_threshold < max_decode_tokens:
+                logger.info(
+                    "HybriMoE: raising decode_token_threshold from %d to %d so that "
+                    "speculative decode verify batches (max_num_seqs=%d, num_speculative_tokens=%d) "
+                    "stay on the pipelined decode path.",
+                    self.decode_token_threshold,
+                    max_decode_tokens,
+                    vllm_config.scheduler_config.max_num_seqs,
+                    num_spec_tokens,
+                )
+                self.decode_token_threshold = max_decode_tokens
 
 
 def hybrimoe_enabled_from_additional_config(additional_config: dict[str, Any] | None) -> bool:

@@ -79,14 +79,11 @@ def derive_num_slots(config, num_experts: int, hidden_size: int, intermediate_si
             config.npu_cache_budget_gb,
         )
     if slots >= num_experts:
-        logger.warning(
-            "HybriMoE derived %d slots per layer >= num_experts (%d): the entire expert set would be "
-            "NPU-resident, which defeats the purpose of expert offloading and wastes HBM. Check that "
-            "npu_cache_budget_gb (%.2f) and the MoE layer count (%d) are as intended.",
+        logger.info(
+            "HybriMoE derived %d slots per layer >= num_experts (%d): the entire expert set will be "
+            "NPU-resident and the MoE forward takes the zero-overhead fast path (baseline-equivalent).",
             slots,
             num_experts,
-            config.npu_cache_budget_gb,
-            num_moe_layers,
         )
     return max(1, min(slots, num_experts))
 
@@ -153,7 +150,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         num_experts = layer.global_num_experts
         num_slots = layer.w13_weight.shape[0]
 
-        if runtime.config.host_store_bf16:
+        if runtime.config.host_store_bf16 and runtime.config.enable_cpu_experts:
             layer.dequant_host_weights()
 
         # Initial cache content: experts 0..num_slots-1 (all MRS scores are
@@ -266,6 +263,12 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         runtime = HybriMoERuntime.get()
         state = runtime.cache.get_layer(layer.layer_name)
         num_tokens = x.shape[0]
+        if state.full_resident:
+            # Every expert is NPU-resident (expert id == slot id), so bypass
+            # the slot remap, D2H routing pack, MRS bookkeeping and miss
+            # handling entirely: this is the baseline eager MoE cost.
+            out = self._npu_fused(state, layer, x, topk_ids.to(torch.int32), topk_weights.to(x.dtype))
+            return FusedExpertsResult(routed_out=out)
         # NOTE: the phase is decided by the token count; the `is_prefill`
         # argument is never set by the 310P forward path.
         if num_tokens > runtime.config.decode_token_threshold:
@@ -313,22 +316,30 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         timing = runtime.config.profile_phases
         t0 = time.perf_counter()
 
-        # Single blocking D2H of the routing pack.
-        flat_ids_pin = layer.pin_topk_ids[: num_tokens * top_k]
-        flat_ids_pin.copy_(topk_ids.view(-1), non_blocking=True)
-        flat_w_pin = layer.pin_topk_w[: num_tokens * top_k]
-        flat_w_pin.copy_(topk_weights.view(-1), non_blocking=True)
+        # Kick off the routing D2H pack on the copy stream, gated by the
+        # routing results on the main stream (same pattern as the pipelined
+        # decode path). The host sync below then only waits for the routing
+        # kernels + a small D2H instead of draining the whole main stream, so
+        # wave planning overlaps the previous layers' device work.
         top_p_scores, top_p_ids = _routing_scores(router_logits, scoring_func).topk(layer.hybrimoe_top_p, dim=-1)
-        layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
-        layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_scores.view(-1), non_blocking=True)
-        main_stream.record_event().synchronize()
+        routing_ready = main_stream.record_event()
+        copy_stream = cache.copy_stream
+        copy_stream.wait_event(routing_ready)
+        with torch.npu.stream(copy_stream):
+            layer.pin_topk_ids[: num_tokens * top_k].copy_(topk_ids.view(-1), non_blocking=True)
+            layer.pin_topk_w[: num_tokens * top_k].copy_(topk_weights.view(-1), non_blocking=True)
+            layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
+            layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_scores.view(-1), non_blocking=True)
+            pack_done = copy_stream.record_event()
+        pack_done.synchronize()
         if timing:
             runtime.record_phase("stream.d2h_sync", t0)
             t0 = time.perf_counter()
 
         self._mrs_update(runtime, state, layer, num_tokens)
 
-        flat_ids = flat_ids_pin
+        flat_ids = layer.pin_topk_ids[: num_tokens * top_k]
+        flat_w_pin = layer.pin_topk_w[: num_tokens * top_k]
         counts_tensor = torch.bincount(flat_ids, minlength=state.num_experts)
         activated = torch.nonzero(counts_tensor).flatten().tolist()
         resident_now = state.expert_to_slot.tolist()
@@ -349,7 +360,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             waves.append(rest[start : start + num_slots])
 
         # (token, expert) pair data on the host, shared by all waves.
-        pair_tokens = torch.arange(num_tokens).repeat_interleave(top_k)
+        pair_tokens = layer.host_pair_tokens[: num_tokens * top_k]
         out = torch.zeros_like(x)
         if timing:
             runtime.record_phase("stream.sched", t0)
@@ -357,9 +368,12 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         for wave_index, wave in enumerate(waves):
             t_wave = time.perf_counter() if timing else 0.0
             protected = set().union(*waves[wave_index:])  # current + future waves
-            to_load = [e for e in wave if int(state.expert_to_slot[e].item()) < 0 and e not in state.in_flight]
+            to_load = [e for e in wave if resident_now[e] < 0 and e not in state.in_flight]
             if to_load:
                 cache.enqueue_transfers(state, to_load, protected, cache.copy_stream)
+                # enqueue_transfers mutates the host residency map; refresh
+                # the local copy once instead of per-expert .item() reads.
+                resident_now = state.expert_to_slot.tolist()
             events = cache.collect_transfer_events(state, wave)
 
             # Compact pair selection: exactly this wave's (token, expert) pairs.
@@ -485,7 +499,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                 assignments = _build_cpu_assignments(flat_ids, flat_w_pin, miss_mask_host, misses, num_tokens, top_k)
                 cpu_handle = executor.submit(layer, assignments, buffer_index, num_tokens)
             else:
-                pair_tokens = torch.arange(num_tokens).repeat_interleave(top_k)
+                pair_tokens = layer.host_pair_tokens[: num_tokens * top_k]
                 for chunk_start in range(0, len(misses), state.num_slots):
                     chunk = misses[chunk_start : chunk_start + state.num_slots]
                     cache.enqueue_transfers(
@@ -861,8 +875,10 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
             self.host_w13_scale = pin_memory_if_available(self.host_w13_scale)
             self.host_w2_scale = pin_memory_if_available(self.host_w2_scale)
         # Dequantized copies for CPU compute, in the model's params_dtype
-        # (float16 on 310P; pageable, never go H2D).
-        if config.host_store_bf16:
+        # (float16 on 310P; pageable, never go H2D). Only the CPU expert
+        # worker reads them, so skip the ~2x host memory when CPU experts
+        # are disabled.
+        if config.host_store_bf16 and config.enable_cpu_experts:
             self.host_w13_dequant = torch.empty(
                 num_experts, 2 * intermediate_size, hidden_size, dtype=self.params_dtype, device="cpu"
             )
@@ -952,3 +968,5 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
         self.dev_topk_w = torch.empty(max_tokens * top_k, dtype=self.params_dtype, device="npu")
         # Pair->token index buffer for the wave-streaming (prefill) path.
         self.dev_pair_tokens = torch.empty(max_tokens * top_k, dtype=torch.int64, device="npu")
+        # Host pair->token table: token i owns pairs [i*top_k, (i+1)*top_k).
+        self.host_pair_tokens = torch.arange(max_tokens, dtype=torch.int64).repeat_interleave(top_k)

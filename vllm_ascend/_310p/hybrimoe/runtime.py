@@ -122,8 +122,10 @@ class HybriMoERuntime:
         logger.info("HybriMoE cost model: %s", self.cost_model.to_json())
 
         # The executor is created lazily on the first decode forward, but
-        # creating it here surfaces allocation problems at startup.
-        self.get_executor(hidden_size, dtype=first_layer.params_dtype)
+        # creating it here surfaces allocation problems at startup. With CPU
+        # experts disabled the executor never runs, so skip it entirely.
+        if self.config.enable_cpu_experts:
+            self.get_executor(hidden_size, dtype=first_layer.params_dtype)
 
         if self.config.prefetch_size > 0 and self.config.prefetch_lookahead > 0:
             self.prefetcher = ImpactDrivenPrefetcher(self.config, self.cache, self.registry, self.cost_model)

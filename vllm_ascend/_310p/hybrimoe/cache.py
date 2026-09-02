@@ -57,6 +57,9 @@ class HybriMoELayerState:
         self.layer_name = layer_name
         self.num_experts = num_experts
         self.num_slots = num_slots
+        # All experts fit in the slot cache: the MoE forward can bypass every
+        # HybriMoE mechanism (remap, D2H pack, MRS, miss handling) entirely.
+        self.full_resident = num_slots >= num_experts
         # Host-side state; pin the device explicitly because this may be
         # constructed while the default device is the NPU (model loading).
         self.expert_to_slot = torch.full((num_experts,), -1, dtype=torch.int32, device="cpu")
