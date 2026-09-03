@@ -376,18 +376,21 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                 # the local copy once instead of per-expert .item() reads.
                 resident_now = state.expert_to_slot.tolist()
             events = cache.collect_transfer_events(state, wave)
+            if timing:
+                runtime.record_phase("stream.wave_enqueue", t_wave)
+                t_wave = time.perf_counter()
 
             # Compact pair selection: exactly this wave's (token, expert) pairs.
             wave_member = torch.zeros(state.num_experts, dtype=torch.bool)
             wave_member[wave] = True
             positions = torch.nonzero(wave_member[flat_ids]).flatten()
             if timing:
-                runtime.record_phase("stream.wave_host", t_wave)
+                runtime.record_phase("stream.wave_select", t_wave)
                 t_wave = time.perf_counter()
 
             self._compact_top1_forward(state, layer, x, positions, flat_ids, flat_w_pin, pair_tokens, out, events)
             if timing:
-                runtime.record_phase("stream.wave_npu", t_wave)
+                runtime.record_phase("stream.wave_compact", t_wave)
 
         # Cross-layer prefetch: stream the next layers' predicted experts
         # while the rest of this layer (attention etc.) runs.
@@ -436,9 +439,13 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         # gated by the routing results on the main stream. It transfers
         # concurrently with the remap + GMM below and never queues behind
         # weight DMAs (those use copy_stream), so the host sync afterwards
-        # is nearly free.
+        # is nearly free. The top-p pack only feeds the MRS scores; it is
+        # refreshed every mrs_interval forwards.
         pack_stream = cache.pack_stream
-        top_p_scores, top_p_ids = _routing_scores(router_logits, scoring_func).topk(layer.hybrimoe_top_p, dim=-1)
+        do_mrs = state.mrs_tick % runtime.config.mrs_interval == 0
+        state.mrs_tick += 1
+        if do_mrs:
+            top_p_scores, top_p_ids = _routing_scores(router_logits, scoring_func).topk(layer.hybrimoe_top_p, dim=-1)
         routing_ready = main_stream.record_event()
         pack_stream.wait_event(routing_ready)
         with torch.npu.stream(pack_stream):
@@ -450,8 +457,11 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                 executor = runtime.get_executor(x.shape[1], dtype=layer.params_dtype)
                 buffer_index = executor.next_buffer()
                 executor.in_buffer(buffer_index)[:num_tokens].copy_(x, non_blocking=True)
-            layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
-            layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_scores.view(-1), non_blocking=True)
+            if do_mrs:
+                layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
+                layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(
+                    top_p_scores.view(-1), non_blocking=True
+                )
             pack_done = pack_stream.record_event()
 
         # 2. Device-side slot remap; no host sync before the GMM.
@@ -478,7 +488,8 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             t0 = time.perf_counter()
 
         # 5. Host bookkeeping (overlaps the device work enqueued above).
-        self._mrs_update(runtime, state, layer, num_tokens)
+        if do_mrs:
+            self._mrs_update(runtime, state, layer, num_tokens)
         flat_ids = layer.pin_topk_ids[: num_tokens * top_k]
         flat_w_pin = layer.pin_topk_w[: num_tokens * top_k]
         counts_tensor = torch.bincount(flat_ids, minlength=state.num_experts)
@@ -507,12 +518,18 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                         state, chunk, protected=set(activated), stream=cache.copy_stream, count_miss=False
                     )
                     events = cache.collect_transfer_events(state, chunk)
+                    if timing:
+                        runtime.record_phase("decode.miss_enqueue", t0)
+                        t0 = time.perf_counter()
                     is_chunk = torch.zeros(state.num_experts, dtype=torch.bool)
                     is_chunk[chunk] = True
                     positions = torch.nonzero(is_chunk[flat_ids]).flatten()
                     self._compact_top1_forward(
                         state, layer, x, positions, flat_ids, flat_w_pin, pair_tokens, out, events
                     )
+                    if timing:
+                        runtime.record_phase("decode.miss_compact", t0)
+                        t0 = time.perf_counter()
         if timing:
             runtime.record_phase("decode.miss_handling", t0)
             t0 = time.perf_counter()

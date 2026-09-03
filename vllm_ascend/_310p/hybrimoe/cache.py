@@ -32,6 +32,8 @@ maps and the in-flight table consistent.
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch_npu
 from vllm.logger import logger
@@ -99,6 +101,8 @@ class HybriMoELayerState:
         # Cache telemetry.
         self.hits = 0
         self.misses = 0
+        # Decode forward counter driving the MRS update interval.
+        self.mrs_tick = 0
 
     def resident_experts(self) -> list[int]:
         return torch.nonzero(self.expert_to_slot >= 0).flatten().tolist()
@@ -473,6 +477,14 @@ class HybriMoECache:
         use_nz = self.use_nz_slots
         batch_params = self._get_batch_params(state, prefetch) if use_nz else None
         staging13, staging2 = self._get_staging(layer, prefetch) if use_nz else (None, None)
+        # Fine-grained host timing of the transfer stages (opt-in via
+        # hybrimoe_config.profile_phases); lazy import avoids the module
+        # cycle with runtime.py.
+        from .runtime import HybriMoERuntime
+
+        runtime = HybriMoERuntime.get()
+        timing = runtime.config.profile_phases
+        t0 = time.perf_counter()
         with torch.npu.stream(stream):
             for start in range(0, len(assignments), _STAGING_ROWS):
                 chunk = assignments[start : start + _STAGING_ROWS]
@@ -490,8 +502,14 @@ class HybriMoECache:
                             [layer.host_w13_int8[e] for e in experts] + [layer.host_w2_int8[e] for e in experts],
                             group="staging_weights",
                         )
+                    if timing:
+                        runtime.record_phase("xfer.dma", t0)
+                        t0 = time.perf_counter()
                     nz13 = torch_npu.npu_format_cast(staging13[:n], ACL_FORMAT_FRACTAL_NZ)
                     nz2 = torch_npu.npu_format_cast(staging2[:n], ACL_FORMAT_FRACTAL_NZ)
+                    if timing:
+                        runtime.record_phase("xfer.cast", t0)
+                        t0 = time.perf_counter()
                     # Stage scales + slot ids through pinned buffers so every
                     # H2D below stays async (pageable sources would make the
                     # host block on the transfer queue).
@@ -522,6 +540,9 @@ class HybriMoECache:
                     layer.w13_weight_scale.data.index_copy_(0, slots_dev, stage["w13_dev"][:n])
                     layer.w2_weight_scale.data.index_copy_(0, slots_dev, stage["w2_dev"][:n])
                     stage["event"] = torch.npu.current_stream().record_event()
+                    if timing:
+                        runtime.record_phase("xfer.slot_write", t0)
+                        t0 = time.perf_counter()
                 else:
                     self._foreach_copy(
                         [layer.w13_weight.data[s] for s in slots]

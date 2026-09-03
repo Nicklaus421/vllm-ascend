@@ -96,6 +96,11 @@ class HybriMoEConfig:
         # Token count at or below which a forward is treated as decode and the
         # hybrid CPU/NPU schedule is applied.
         self.decode_token_threshold: int = int(config.get("decode_token_threshold", 32))
+        # Update the MRS cache-priority scores (and the top-p routing pack that
+        # feeds them) only every N decode forwards per layer. The scores are
+        # slow-moving; skipping most updates saves several NPU launches and
+        # host ops per layer per step on launch-bound hosts.
+        self.mrs_interval: int = int(config.get("mrs_interval", 1))
         # Cost-model calibration run at startup (measures NPU/CPU compute and
         # H2D transfer times on the actual machine).
         calibration = config.get("calibration", {})
@@ -126,6 +131,8 @@ class HybriMoEConfig:
             raise ValueError(f"hybrimoe_config.num_cpu_threads must be >= 0, got {self.num_cpu_threads}")
         if self.decode_token_threshold < 1:
             raise ValueError(f"hybrimoe_config.decode_token_threshold must be >= 1, got {self.decode_token_threshold}")
+        if self.mrs_interval < 1:
+            raise ValueError(f"hybrimoe_config.mrs_interval must be >= 1, got {self.mrs_interval}")
 
     def validate_against_vllm_config(self, vllm_config: "VllmConfig"):
         """Hardware / parallelism guards. Called when the config is enabled."""
