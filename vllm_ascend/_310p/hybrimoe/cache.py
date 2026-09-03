@@ -160,6 +160,10 @@ class HybriMoECache:
         # at startup; falls back to ND on failure).
         self.use_nz_slots = True
         self.nz_validated = False
+        # Whether index_copy_ along the slot dim of an NZ-format weight tensor
+        # is byte-identical to per-slot copy_ (probed once at startup). Enables
+        # single-launch batched slot writes in the transfer path.
+        self.nz_index_copy_ok = False
         self._foreach_copy_ok: dict[str, bool] = {}
 
     # ------------------------------------------------------------------
@@ -253,6 +257,20 @@ class HybriMoECache:
                 "HybriMoE: per-slot NZ layout validation failed; falling back to ND slot weights "
                 "(MoE grouped matmul will be slower)."
             )
+            return ok
+        # Probe batched NZ slot writes: index_copy_ along the slot dim must
+        # byte-match the per-slot copy_ validated above. Slot 0 holds expert 0
+        # after the initial fill and probe_nz is expert 0's own cast, so this
+        # write is idempotent.
+        try:
+            idx0 = torch.zeros(1, dtype=torch.int64, device="npu")
+            layer.w13_weight.data.index_copy_(0, idx0, probe_nz)
+            torch.npu.synchronize()
+            self.nz_index_copy_ok = bool(torch.equal(layer.w13_weight.data[0], probe_nz[0]))
+        except Exception:  # noqa: BLE001
+            self.nz_index_copy_ok = False
+        if not self.nz_index_copy_ok:
+            logger.warning_once("HybriMoE: index_copy_ into NZ slot weights unsupported; using per-slot copies.")
         return ok
 
     # ------------------------------------------------------------------
@@ -411,19 +429,29 @@ class HybriMoECache:
                         )
                     nz13 = torch_npu.npu_format_cast(staging13[:n], ACL_FORMAT_FRACTAL_NZ)
                     nz2 = torch_npu.npu_format_cast(staging2[:n], ACL_FORMAT_FRACTAL_NZ)
-                    # NOTE: foreach_copy does not support NZ (internal format)
-                    # destinations, so the slot NZ blocks go in their own
-                    # group; scales are plain-format and share another.
-                    self._foreach_copy(
-                        [layer.w13_weight.data[s] for s in slots] + [layer.w2_weight.data[s] for s in slots],
-                        list(nz13.unbind(0)) + list(nz2.unbind(0)),
-                        group="nz_slot_weights",
+                    slots_dev = torch.tensor(slots, dtype=torch.int64, device="npu")
+                    if self.nz_index_copy_ok:
+                        # One batched write per weight tensor (validated at
+                        # startup to byte-match per-slot copy_).
+                        layer.w13_weight.data.index_copy_(0, slots_dev, nz13)
+                        layer.w2_weight.data.index_copy_(0, slots_dev, nz2)
+                    else:
+                        # NOTE: foreach_copy does not support NZ (internal format)
+                        # destinations, so the slot NZ blocks go in their own
+                        # group.
+                        self._foreach_copy(
+                            [layer.w13_weight.data[s] for s in slots] + [layer.w2_weight.data[s] for s in slots],
+                            list(nz13.unbind(0)) + list(nz2.unbind(0)),
+                            group="nz_slot_weights",
+                        )
+                    # Scales are plain-format: gather on the host, one H2D and
+                    # one index_copy_ per tensor instead of 2n tiny copies.
+                    experts_host = torch.tensor(experts, dtype=torch.int64)
+                    layer.w13_weight_scale.data.index_copy_(
+                        0, slots_dev, layer.host_w13_scale[experts_host].to("npu", non_blocking=True)
                     )
-                    self._foreach_copy(
-                        [layer.w13_weight_scale.data[s] for s in slots]
-                        + [layer.w2_weight_scale.data[s] for s in slots],
-                        [layer.host_w13_scale[e] for e in experts] + [layer.host_w2_scale[e] for e in experts],
-                        group="scales",
+                    layer.w2_weight_scale.data.index_copy_(
+                        0, slots_dev, layer.host_w2_scale[experts_host].to("npu", non_blocking=True)
                     )
                 else:
                     self._foreach_copy(
