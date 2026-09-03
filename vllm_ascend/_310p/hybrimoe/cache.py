@@ -39,6 +39,7 @@ from vllm.logger import logger
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 from .config import HybriMoEConfig
+from .utils import pin_memory_if_available
 
 # Sentinel slot for CPU-bound (token, expert) pairs on the NPU side: their
 # routing weight is zeroed, so the sentinel slot's compute contributes
@@ -48,6 +49,12 @@ SENTINEL_SLOT = 0
 # Number of experts processed per H2D -> NZ-cast -> slot-copy chunk; bounds
 # the ND staging memory to a few hundred MB.
 _STAGING_ROWS = 32
+
+# Rotating pinned scale/slot-id staging sets per transfer stream. The H2D of
+# gathered scales must come from pinned memory: a pageable source makes the
+# copy synchronous and blocks the host on the whole transfer queue. Rotation
+# bounds how many chunks may be in flight before a buffer is rewritten.
+_SCALE_STAGE_BUFS = 4
 
 
 class HybriMoELayerState:
@@ -154,8 +161,10 @@ class HybriMoECache:
         self.layers: dict[str, HybriMoELayerState] = {}
         self._copy_stream = None
         self._prefetch_stream = None
+        self._pack_stream = None
         self._staging_copy = None
         self._staging_prefetch = None
+        self._scale_stage: dict[str, list] = {}
         # Whether slot weights are kept in FRACTAL_NZ format (validated once
         # at startup; falls back to ND on failure).
         self.use_nz_slots = True
@@ -180,6 +189,17 @@ class HybriMoECache:
         if self._prefetch_stream is None:
             self._prefetch_stream = torch.npu.Stream()
         return self._prefetch_stream
+
+    @property
+    def pack_stream(self):
+        """Dedicated stream for the small per-forward routing D2H packs.
+
+        Weight transfers queue on copy_stream; a routing pack enqueued behind
+        them would make the host's pack_done sync wait for megabytes of DMA.
+        """
+        if self._pack_stream is None:
+            self._pack_stream = torch.npu.Stream()
+        return self._pack_stream
 
     # ------------------------------------------------------------------
     # Layer registration
@@ -392,6 +412,49 @@ class HybriMoECache:
         state.in_flight.clear()
         return events
 
+    def _acquire_scale_stage(self, layer: torch.nn.Module, prefetch: bool) -> dict:
+        """Rotating pinned staging for one transfer chunk's scales + slot ids.
+
+        Gathered scale rows and slot ids must feed the H2D from pinned memory;
+        a pageable source turns the copy synchronous and blocks the host on
+        the whole transfer queue. Each buffer carries a completion event so a
+        host rewrite only waits when _SCALE_STAGE_BUFS chunks are in flight.
+        """
+        key = "prefetch" if prefetch else "copy"
+        entry = self._scale_stage.get(key)
+        if entry is None:
+            bufs = [
+                {
+                    "w13_pin": pin_memory_if_available(
+                        torch.empty(_STAGING_ROWS, *layer.host_w13_scale.shape[1:], dtype=torch.float32, device="cpu")
+                    ),
+                    "w2_pin": pin_memory_if_available(
+                        torch.empty(_STAGING_ROWS, *layer.host_w2_scale.shape[1:], dtype=torch.float32, device="cpu")
+                    ),
+                    "slots_pin": pin_memory_if_available(
+                        torch.empty(_STAGING_ROWS, dtype=torch.int64, device="cpu")
+                    ),
+                    "w13_dev": torch.empty(
+                        _STAGING_ROWS, *layer.host_w13_scale.shape[1:], dtype=torch.float32, device="npu"
+                    ),
+                    "w2_dev": torch.empty(
+                        _STAGING_ROWS, *layer.host_w2_scale.shape[1:], dtype=torch.float32, device="npu"
+                    ),
+                    "slots_dev": torch.empty(_STAGING_ROWS, dtype=torch.int64, device="npu"),
+                    "event": None,
+                }
+                for _ in range(_SCALE_STAGE_BUFS)
+            ]
+            entry = [bufs, 0]
+            self._scale_stage[key] = entry
+        bufs, cursor = entry
+        buf = bufs[cursor]
+        entry[1] = (cursor + 1) % _SCALE_STAGE_BUFS
+        if buf["event"] is not None:
+            buf["event"].synchronize()
+            buf["event"] = None
+        return buf
+
     def _copy_experts_to_slots(
         self,
         state: HybriMoELayerState,
@@ -429,7 +492,18 @@ class HybriMoECache:
                         )
                     nz13 = torch_npu.npu_format_cast(staging13[:n], ACL_FORMAT_FRACTAL_NZ)
                     nz2 = torch_npu.npu_format_cast(staging2[:n], ACL_FORMAT_FRACTAL_NZ)
-                    slots_dev = torch.tensor(slots, dtype=torch.int64, device="npu")
+                    # Stage scales + slot ids through pinned buffers so every
+                    # H2D below stays async (pageable sources would make the
+                    # host block on the transfer queue).
+                    stage = self._acquire_scale_stage(layer, prefetch)
+                    experts_host = torch.tensor(experts, dtype=torch.int64)
+                    stage["w13_pin"][:n].copy_(layer.host_w13_scale[experts_host])
+                    stage["w2_pin"][:n].copy_(layer.host_w2_scale[experts_host])
+                    stage["slots_pin"][:n].copy_(torch.tensor(slots, dtype=torch.int64))
+                    stage["slots_dev"][:n].copy_(stage["slots_pin"][:n], non_blocking=True)
+                    stage["w13_dev"][:n].copy_(stage["w13_pin"][:n], non_blocking=True)
+                    stage["w2_dev"][:n].copy_(stage["w2_pin"][:n], non_blocking=True)
+                    slots_dev = stage["slots_dev"][:n]
                     if self.nz_index_copy_ok:
                         # One batched write per weight tensor (validated at
                         # startup to byte-match per-slot copy_).
@@ -444,15 +518,10 @@ class HybriMoECache:
                             list(nz13.unbind(0)) + list(nz2.unbind(0)),
                             group="nz_slot_weights",
                         )
-                    # Scales are plain-format: gather on the host, one H2D and
-                    # one index_copy_ per tensor instead of 2n tiny copies.
-                    experts_host = torch.tensor(experts, dtype=torch.int64)
-                    layer.w13_weight_scale.data.index_copy_(
-                        0, slots_dev, layer.host_w13_scale[experts_host].to("npu", non_blocking=True)
-                    )
-                    layer.w2_weight_scale.data.index_copy_(
-                        0, slots_dev, layer.host_w2_scale[experts_host].to("npu", non_blocking=True)
-                    )
+                    # Scales are plain-format: one index_copy_ per tensor.
+                    layer.w13_weight_scale.data.index_copy_(0, slots_dev, stage["w13_dev"][:n])
+                    layer.w2_weight_scale.data.index_copy_(0, slots_dev, stage["w2_dev"][:n])
+                    stage["event"] = torch.npu.current_stream().record_event()
                 else:
                     self._foreach_copy(
                         [layer.w13_weight.data[s] for s in slots]

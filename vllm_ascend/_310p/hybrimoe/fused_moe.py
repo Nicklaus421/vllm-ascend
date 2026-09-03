@@ -316,21 +316,22 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         timing = runtime.config.profile_phases
         t0 = time.perf_counter()
 
-        # Kick off the routing D2H pack on the copy stream, gated by the
-        # routing results on the main stream (same pattern as the pipelined
-        # decode path). The host sync below then only waits for the routing
-        # kernels + a small D2H instead of draining the whole main stream, so
-        # wave planning overlaps the previous layers' device work.
+        # Kick off the routing D2H pack on the dedicated pack stream, gated by
+        # the routing results on the main stream (same pattern as the
+        # pipelined decode path). The host sync below then only waits for the
+        # routing kernels + a small D2H — never for queued weight DMAs or the
+        # rest of the main stream — so wave planning overlaps device work.
         top_p_scores, top_p_ids = _routing_scores(router_logits, scoring_func).topk(layer.hybrimoe_top_p, dim=-1)
         routing_ready = main_stream.record_event()
         copy_stream = cache.copy_stream
-        copy_stream.wait_event(routing_ready)
-        with torch.npu.stream(copy_stream):
+        pack_stream = cache.pack_stream
+        pack_stream.wait_event(routing_ready)
+        with torch.npu.stream(pack_stream):
             layer.pin_topk_ids[: num_tokens * top_k].copy_(topk_ids.view(-1), non_blocking=True)
             layer.pin_topk_w[: num_tokens * top_k].copy_(topk_weights.view(-1), non_blocking=True)
             layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
             layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_scores.view(-1), non_blocking=True)
-            pack_done = copy_stream.record_event()
+            pack_done = pack_stream.record_event()
         pack_done.synchronize()
         if timing:
             runtime.record_phase("stream.d2h_sync", t0)
@@ -380,14 +381,11 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             wave_member = torch.zeros(state.num_experts, dtype=torch.bool)
             wave_member[wave] = True
             positions = torch.nonzero(wave_member[flat_ids]).flatten()
-            sel_tokens = pair_tokens[positions]
-            sel_slots = state.expert_to_slot[flat_ids[positions]].to(torch.int32)
-            sel_weights = flat_w_pin[positions]
             if timing:
                 runtime.record_phase("stream.wave_host", t_wave)
                 t_wave = time.perf_counter()
 
-            self._compact_top1_forward(state, layer, x, sel_tokens, sel_slots, sel_weights, out, events)
+            self._compact_top1_forward(state, layer, x, positions, flat_ids, flat_w_pin, pair_tokens, out, events)
             if timing:
                 runtime.record_phase("stream.wave_npu", t_wave)
 
@@ -434,13 +432,16 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         t0 = time.perf_counter()
         t_total = t0
 
-        # 1. Kick off the routing D2H pack on the copy stream, gated by the
-        # routing results on the main stream. It transfers concurrently with
-        # the remap + GMM below, so the host sync afterwards is nearly free.
+        # 1. Kick off the routing D2H pack on the dedicated pack stream,
+        # gated by the routing results on the main stream. It transfers
+        # concurrently with the remap + GMM below and never queues behind
+        # weight DMAs (those use copy_stream), so the host sync afterwards
+        # is nearly free.
+        pack_stream = cache.pack_stream
         top_p_scores, top_p_ids = _routing_scores(router_logits, scoring_func).topk(layer.hybrimoe_top_p, dim=-1)
         routing_ready = main_stream.record_event()
-        copy_stream.wait_event(routing_ready)
-        with torch.npu.stream(copy_stream):
+        pack_stream.wait_event(routing_ready)
+        with torch.npu.stream(pack_stream):
             layer.pin_topk_ids[: num_tokens * top_k].copy_(topk_ids.view(-1), non_blocking=True)
             layer.pin_topk_w[: num_tokens * top_k].copy_(topk_weights.view(-1), non_blocking=True)
             executor = None
@@ -451,7 +452,7 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                 executor.in_buffer(buffer_index)[:num_tokens].copy_(x, non_blocking=True)
             layer.pin_top_p_ids[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_ids.view(-1), non_blocking=True)
             layer.pin_top_p_scores[: num_tokens * layer.hybrimoe_top_p].copy_(top_p_scores.view(-1), non_blocking=True)
-            pack_done = copy_stream.record_event()
+            pack_done = pack_stream.record_event()
 
         # 2. Device-side slot remap; no host sync before the GMM.
         slot_ids = state.dev_expert_to_slot[topk_ids]
@@ -509,10 +510,9 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                     is_chunk = torch.zeros(state.num_experts, dtype=torch.bool)
                     is_chunk[chunk] = True
                     positions = torch.nonzero(is_chunk[flat_ids]).flatten()
-                    sel_tokens = pair_tokens[positions]
-                    sel_slots = state.expert_to_slot[flat_ids[positions]].to(torch.int32)
-                    sel_weights = flat_w_pin[positions]
-                    self._compact_top1_forward(state, layer, x, sel_tokens, sel_slots, sel_weights, out, events)
+                    self._compact_top1_forward(
+                        state, layer, x, positions, flat_ids, flat_w_pin, pair_tokens, out, events
+                    )
         if timing:
             runtime.record_phase("decode.miss_handling", t0)
             t0 = time.perf_counter()
@@ -740,31 +740,49 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         state: HybriMoELayerState,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        sel_tokens: torch.Tensor,
-        sel_slots: torch.Tensor,
-        sel_weights: torch.Tensor,
+        positions: torch.Tensor,
+        flat_ids: torch.Tensor,
+        flat_w_pin: torch.Tensor,
+        pair_tokens: torch.Tensor,
         out: torch.Tensor,
         wait_events: list,
     ) -> None:
         """Compute a subset of (token, expert) pairs and accumulate into `out`.
 
-        sel_* are host tensors; each selected pair is dispatched as an
-        independent top-1 token, so the number of GMM rows equals exactly the
-        number of pairs (no sentinel waste). Buffer reuse across calls is
-        ordered by an event chain (state.last_compact_event).
+        `positions` selects the pairs from the flattened (token, expert)
+        arrays; each selected pair is dispatched as an independent top-1
+        token, so the number of GMM rows equals exactly the number of pairs
+        (no sentinel waste). The pair pack is gathered on the host directly
+        into pinned staging so the H2D stays async (a pageable source would
+        block the host on the transfer queue). Buffer reuse across calls is
+        ordered by event chains (last_compact_event for the dev buffers, the
+        per-buffer event for the pinned staging).
         """
-        n = sel_tokens.numel()
+        n = positions.numel()
         copy_stream = HybriMoERuntime.get().cache.copy_stream
         main_stream = torch.npu.current_stream()
+        buf = layer.pin_compact[layer.compact_cursor]
+        layer.compact_cursor = (layer.compact_cursor + 1) % len(layer.pin_compact)
+        if buf["event"] is not None:
+            # The previous pack's H2D from this buffer must have landed before
+            # the host overwrites it.
+            buf["event"].synchronize()
+            buf["event"] = None
+        # Gather the pair pack on the host, straight into pinned staging.
+        torch.index_select(flat_ids, 0, positions, out=buf["ids64"][:n])
+        torch.index_select(state.expert_to_slot, 0, buf["ids64"][:n], out=buf["ids"][:n])
+        torch.index_select(flat_w_pin, 0, positions, out=buf["w"][:n])
+        torch.index_select(pair_tokens, 0, positions, out=buf["tok"][:n])
         with torch.npu.stream(copy_stream):
             if state.last_compact_event is not None:
                 # The previous compact forward may still be reading the shared
                 # dev buffers; order this H2D after it.
                 copy_stream.wait_event(state.last_compact_event)
-            layer.dev_topk_ids[:n].copy_(sel_slots, non_blocking=True)
-            layer.dev_topk_w[:n].copy_(sel_weights, non_blocking=True)
-            layer.dev_pair_tokens[:n].copy_(sel_tokens, non_blocking=True)
+            layer.dev_topk_ids[:n].copy_(buf["ids"][:n], non_blocking=True)
+            layer.dev_topk_w[:n].copy_(buf["w"][:n], non_blocking=True)
+            layer.dev_pair_tokens[:n].copy_(buf["tok"][:n], non_blocking=True)
             ready_event = copy_stream.record_event()
+        buf["event"] = ready_event
         main_stream.wait_event(ready_event)
         for event in wait_events:
             main_stream.wait_event(event)
@@ -970,3 +988,18 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
         self.dev_pair_tokens = torch.empty(max_tokens * top_k, dtype=torch.int64, device="npu")
         # Host pair->token table: token i owns pairs [i*top_k, (i+1)*top_k).
         self.host_pair_tokens = torch.arange(max_tokens, dtype=torch.int64).repeat_interleave(top_k)
+        # Pinned staging for the compact top-1 pair packs. The H2D must be
+        # sourced from pinned memory: pageable sources turn the copy
+        # synchronous and block the host on the transfer queue. Two rotating
+        # sets; reuse is guarded by the H2D completion event of the pack.
+        self.pin_compact = [
+            {
+                "ids64": pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int64, device="cpu")),
+                "ids": pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int32, device="cpu")),
+                "w": pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.float32, device="cpu")),
+                "tok": pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int64, device="cpu")),
+                "event": None,
+            }
+            for _ in range(2)
+        ]
+        self.compact_cursor = 0
