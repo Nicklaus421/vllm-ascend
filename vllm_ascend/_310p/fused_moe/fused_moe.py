@@ -66,14 +66,21 @@ class AscendUnquantizedFusedMoEMethod310(UnquantizedFusedMoEMethod):
     def process_weights_after_loading(self, layer):
         super().process_weights_after_loading(layer)
 
-        # Fused gate_up_proj (column parallel)
+        # Fused gate_up_proj (column parallel). Release the original storage
+        # before the NZ cast so the transient peak is 2x (not 3x) the tensor
+        # size — full-size MoE stacks (e.g. the MTP drafter) otherwise OOM
+        # here when the NPU is already nearly full.
         w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
-        w13_data = maybe_trans_nz(w13_data)
-        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+        layer.w13_weight.data = torch.empty(0, dtype=w13_data.dtype, device=w13_data.device)
+        w13_nz = maybe_trans_nz(w13_data)
+        del w13_data
+        layer.w13_weight = torch.nn.Parameter(w13_nz, requires_grad=False)
         # down_proj (row parallel)
         w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
-        w2_data = maybe_trans_nz(w2_data)
-        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+        layer.w2_weight.data = torch.empty(0, dtype=w2_data.dtype, device=w2_data.device)
+        w2_nz = maybe_trans_nz(w2_data)
+        del w2_data
+        layer.w2_weight = torch.nn.Parameter(w2_nz, requires_grad=False)
 
     def apply(
         self,
