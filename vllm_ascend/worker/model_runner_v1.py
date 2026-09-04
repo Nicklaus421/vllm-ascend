@@ -3804,7 +3804,13 @@ class NPUModelRunner(GPUModelRunner):
         ) # type: bool
         
         # wrap the model with full graph wrapper if needed.
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+        # HybriMoE is the exception: its MoE forward contains host
+        # synchronization that cannot be graph-captured, so the FX graph is
+        # split at the MoE/attention ops and only the segments in between are
+        # captured as piecewise aclgraphs. Wrapping the whole model in a FULL
+        # aclgraph would put the MoE host syncs inside the capture.
+        hybrimoe_split_moe = self.ascend_config.hybrimoe_config.enabled
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs() and not hybrimoe_split_moe:
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.model = ACLGraphWrapper(
                 self.model,

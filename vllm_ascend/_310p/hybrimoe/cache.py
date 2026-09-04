@@ -79,6 +79,11 @@ class HybriMoELayerState:
         self.dev_expert_to_slot: torch.Tensor | None = None
         # Event of the last compact top-1 forward; guards dev-buffer reuse.
         self.last_compact_event = None
+        # Per-staging-buffer H2D completion events of the compact top-1 path;
+        # guard host-side reuse of the pinned staging buffers (double buffered,
+        # so a wave/prefetch overlap is preserved).
+        self.last_compact_h2d_events: list = [None, None]
+        self.compact_buf_index: int = 0
         # Frozen dispatch parameter objects (constant per layer; avoids
         # re-allocating them on every forward).
         self.routing_params = None

@@ -742,15 +742,32 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         n = sel_tokens.numel()
         copy_stream = HybriMoERuntime.get().cache.copy_stream
         main_stream = torch.npu.current_stream()
+        # Double-buffered pinned staging: sel_* are pageable host tensors, and
+        # a pageable H2D copy_ degrades to a synchronous copy that would block
+        # the host until the copy stream drains the expert weight transfers
+        # queued just before. Staging through pinned memory makes the H2D
+        # truly asynchronous.
+        buf_index = state.compact_buf_index
+        state.compact_buf_index = 1 - buf_index
+        last_h2d = state.last_compact_h2d_events[buf_index]
+        if last_h2d is not None and not last_h2d.query():
+            # Host-side reuse guard for the pinned staging. Two buffers are
+            # rotated, so this waits on the H2D from two compact forwards ago,
+            # which has long completed in steady state and never stalls here.
+            last_h2d.synchronize()
+        layer.pin_compact_ids[buf_index][:n].copy_(sel_slots)
+        layer.pin_compact_w[buf_index][:n].copy_(sel_weights)
+        layer.pin_compact_tokens[buf_index][:n].copy_(sel_tokens)
         with torch.npu.stream(copy_stream):
             if state.last_compact_event is not None:
                 # The previous compact forward may still be reading the shared
                 # dev buffers; order this H2D after it.
                 copy_stream.wait_event(state.last_compact_event)
-            layer.dev_topk_ids[:n].copy_(sel_slots, non_blocking=True)
-            layer.dev_topk_w[:n].copy_(sel_weights, non_blocking=True)
-            layer.dev_pair_tokens[:n].copy_(sel_tokens, non_blocking=True)
+            layer.dev_topk_ids[:n].copy_(layer.pin_compact_ids[buf_index][:n], non_blocking=True)
+            layer.dev_topk_w[:n].copy_(layer.pin_compact_w[buf_index][:n], non_blocking=True)
+            layer.dev_pair_tokens[:n].copy_(layer.pin_compact_tokens[buf_index][:n], non_blocking=True)
             ready_event = copy_stream.record_event()
+        state.last_compact_h2d_events[buf_index] = ready_event
         main_stream.wait_event(ready_event)
         for event in wait_events:
             main_stream.wait_event(event)
@@ -952,3 +969,17 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
         self.dev_topk_w = torch.empty(max_tokens * top_k, dtype=self.params_dtype, device="npu")
         # Pair->token index buffer for the wave-streaming (prefill) path.
         self.dev_pair_tokens = torch.empty(max_tokens * top_k, dtype=torch.int64, device="npu")
+        # Pinned staging for the compact top-1 (miss wave) H2D pack, double
+        # buffered so back-to-back waves overlap: copying from pageable tensors
+        # would degrade to a synchronous copy and block the host behind the
+        # expert weight transfers queued on the copy stream.
+        self.pin_compact_ids = [
+            pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int32, device="cpu")) for _ in range(2)
+        ]
+        self.pin_compact_w = [
+            pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.float32, device="cpu"))
+            for _ in range(2)
+        ]
+        self.pin_compact_tokens = [
+            pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int64, device="cpu")) for _ in range(2)
+        ]

@@ -166,12 +166,31 @@ class NPUModelRunner310(NPUModelRunner):
             force_eager = True
 
         # Spec decoding graph replay is only valid for uniform spec-decode batches (q_len = 1 + K).
-        if self.speculative_config is not None and (
-            self.attn_state != AscendAttentionState.SpecDecoding
-            or max_num_scheduled_tokens != self.uniform_decode_query_len
-            or num_tokens != max_num_scheduled_tokens * num_reqs
+        # The gating is runtime-only: during graph capture force_uniform_decode is passed
+        # explicitly and the requested runtime mode must match the dispatcher result.
+        if (
+            force_uniform_decode is None
+            and self.speculative_config is not None
+            and (
+                self.attn_state != AscendAttentionState.SpecDecoding
+                or max_num_scheduled_tokens != self.uniform_decode_query_len
+                or num_tokens != max_num_scheduled_tokens * num_reqs
+            )
         ):
             force_eager = True
+
+        if self.ascend_config.hybrimoe_config.enabled and force_uniform_decode is None:
+            # HybriMoE: the main model is only captured as piecewise aclgraphs
+            # (the MoE forward with host syncs is split out to eager); FULL
+            # whole-model graphs are reserved for the fully NPU-resident MTP
+            # drafter, which dispatches separately. Dispatch uniform decode
+            # batches as non-uniform so the main model replays its PIECEWISE
+            # segments instead of being dispatched to a FULL graph that does
+            # not exist for it.
+            # force_uniform_decode is passed explicitly during graph capture,
+            # where the requested runtime mode must match the dispatcher
+            # result; this override therefore only applies at runtime.
+            force_uniform_decode = False
 
         if force_uniform_decode is None and self.attn_state == AscendAttentionState.DecodeOnly:
             decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN

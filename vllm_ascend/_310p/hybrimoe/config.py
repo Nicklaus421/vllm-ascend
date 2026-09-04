@@ -85,6 +85,12 @@ class HybriMoEConfig:
         # model (safe default; the MoE forward contains host syncs). "piecewise":
         # experimental - capture non-MoE parts in piecewise aclgraphs with the
         # MoE forward ops split out to eager.
+        # The preferred way to enable graph mode is the standard CLI option
+        # --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", ...}',
+        # which is realized as FULL_AND_PIECEWISE: main-model segments are
+        # captured as piecewise aclgraphs (attention/MoE ops eager) and the
+        # fully NPU-resident MTP drafter gets full aclgraphs for uniform
+        # decode batches.
         self.graph_mode: str = str(config.get("graph_mode", "eager"))
         if self.graph_mode not in ("eager", "piecewise"):
             raise ValueError(f"hybrimoe_config.graph_mode must be 'eager' or 'piecewise', got {self.graph_mode}")

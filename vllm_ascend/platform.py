@@ -241,6 +241,46 @@ class NPUPlatform(Platform):
         return min(max_num_seqs * decode_query_len, 512)
 
     @classmethod
+    def _extend_capture_sizes_for_full_decode(cls, vllm_config: VllmConfig) -> None:
+        """Extend user-given cudagraph_capture_sizes to cover full decode batches.
+
+        Capture sizes are token counts, so a uniform decode batch needs up to
+        ``max_num_seqs * (1 + num_speculative_tokens)`` tokens. If the user's
+        list stops below that, decode batches above the largest size silently
+        fall back to eager. Extend the list (keeping multiples of the uniform
+        decode query length so FULL keys stay valid) up to the required max.
+        """
+        compilation_config = vllm_config.compilation_config
+        sizes = compilation_config.cudagraph_capture_sizes
+        if not sizes:
+            return
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+        if max_num_seqs is None:
+            return
+        decode_query_len = 1
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config and speculative_config.num_speculative_tokens:
+            decode_query_len += speculative_config.num_speculative_tokens
+        required_max = max_num_seqs * decode_query_len
+        if max(sizes) >= required_max:
+            return
+        extended = sorted(set(sizes) | set(range(sizes[0], required_max, decode_query_len)) | {required_max})
+        logger.warning(
+            "cudagraph_capture_sizes %s do not cover the full decode range "
+            "(max_num_seqs=%d x query_len=%d = %d tokens); extending to %s. "
+            "More capture sizes consume more graph memory; reduce max_num_seqs "
+            "or trim the list if capture fails with OOM.",
+            sizes,
+            max_num_seqs,
+            decode_query_len,
+            required_max,
+            extended,
+        )
+        compilation_config.cudagraph_capture_sizes = extended
+        compilation_config.max_cudagraph_capture_size = extended[-1]
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0):
         return None
 
@@ -525,7 +565,25 @@ class NPUPlatform(Platform):
                 compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
         if ascend_config.hybrimoe_config.enabled:
-            if ascend_config.hybrimoe_config.graph_mode == "piecewise":
+            if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY and not enforce_eager:
+                # The HybriMoE MoE forward contains host synchronization and
+                # CPU-thread work that cannot be graph-captured, so a
+                # full-graph request is realized as FULL_AND_PIECEWISE: the FX
+                # graph is split at the attention and MoE ops (both run
+                # eagerly), the remaining segments are captured as piecewise
+                # aclgraphs, and the fully NPU-resident MTP drafter still gets
+                # full aclgraphs for uniform decode batches.
+                logger.info(
+                    "HybriMoE is enabled: realizing requested FULL_DECODE_ONLY as FULL_AND_PIECEWISE "
+                    "with the MoE forward split out to eager."
+                )
+                compilation_config.mode = CompilationMode.VLLM_COMPILE
+                compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+                cls._extend_capture_sizes_for_full_decode(vllm_config)
+            elif (
+                ascend_config.hybrimoe_config.graph_mode == "piecewise"
+                or compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+            ) and not enforce_eager:
                 # Experimental: keep non-MoE parts in piecewise aclgraphs; the
                 # hybrid CPU-NPU MoE forward (host syncs) is split out to eager.
                 logger.info("HybriMoE is enabled: using PIECEWISE cudagraph with MoE ops split out.")
@@ -534,7 +592,9 @@ class NPUPlatform(Platform):
             else:
                 logger.info(
                     "HybriMoE is enabled: forcing eager mode because the hybrid CPU-NPU "
-                    "MoE forward contains host synchronization that cannot be graph-captured."
+                    "MoE forward contains host synchronization that cannot be graph-captured. "
+                    "To enable graph mode with HybriMoE, pass "
+                    '--compilation-config \'{"cudagraph_mode": "FULL_DECODE_ONLY"}\'.'
                 )
                 enforce_eager = True
                 model_config.enforce_eager = True
@@ -653,9 +713,26 @@ class NPUPlatform(Platform):
             vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
             vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
         elif compilation_config.cudagraph_mode.has_full_cudagraphs():
-            # We don't want to have our FX graph split for the sake of static kernel feature,
-            # because it will compile multiple times, so we set splitting_ops to empty manually.
-            compilation_config.splitting_ops = []
+            if ascend_config.hybrimoe_config.enabled:
+                # HybriMoE still needs the FX graph split at the attention and
+                # MoE ops for full modes: those ops run eagerly outside the
+                # captured segments, so splitting_ops must not be cleared.
+                compilation_config.set_splitting_ops_for_v1(
+                    all2all_backend=vllm_config.parallel_config.all2all_backend,
+                    data_parallel_size=vllm_config.parallel_config.data_parallel_size,
+                )
+                compilation_config.splitting_ops.extend(
+                    [
+                        "vllm::mla_forward",
+                        "vllm::dsa_forward",
+                        "vllm::moe_forward",
+                        "vllm::moe_forward_shared",
+                    ]
+                )
+            else:
+                # We don't want to have our FX graph split for the sake of static kernel feature,
+                # because it will compile multiple times, so we set splitting_ops to empty manually.
+                compilation_config.splitting_ops = []
         else:
             logger.info(
                 "%s cudagraph_mode is not support on NPU. falling back to NONE", compilation_config.cudagraph_mode
