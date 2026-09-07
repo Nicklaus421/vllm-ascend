@@ -37,6 +37,8 @@ blocks on it in the common case (`event.query()` polling).
 
 from __future__ import annotations
 
+import time
+
 import torch
 from vllm.logger import logger
 
@@ -80,6 +82,7 @@ class ImpactDrivenPrefetcher:
         top_k: int,
         scoring_func: str,
         prefill: bool = False,
+        record_phase=None,
     ) -> None:
         if prefill:
             # The streaming prefill path already streams every activated
@@ -92,6 +95,7 @@ class ImpactDrivenPrefetcher:
             return
         position = self.registry.position_of(state.layer_name)
         num_tokens = x.shape[0]
+        t0 = time.perf_counter() if record_phase is not None else 0.0
 
         # 1. Consume ready (or discard stale) predictions first, so the ring
         #    slots are free before new predictions are launched.
@@ -103,7 +107,10 @@ class ImpactDrivenPrefetcher:
             if not event.query():
                 continue
             del self._pending[next_position]
-            self._issue_prefetches(next_position, buffer[: tokens * k], prefill)
+            self._issue_prefetches(next_position, buffer[: tokens * k], prefill, record_phase)
+        if record_phase is not None:
+            record_phase("prefetch.consume", t0)
+            t0 = time.perf_counter()
 
         # 2. Launch predictions for upcoming layers into free ring slots.
         busy_rings = {p % self.lookahead for p in self._pending}
@@ -124,9 +131,14 @@ class ImpactDrivenPrefetcher:
             buffer[:needed].copy_(predicted_ids.view(-1), non_blocking=True)
             self._pending[next_position] = (main_stream.record_event(), buffer, num_tokens, top_k)
             busy_rings.add(ring)
+        if record_phase is not None:
+            record_phase("prefetch.predict", t0)
 
     # ------------------------------------------------------------------
-    def _issue_prefetches(self, next_position: int, predicted_ids: torch.Tensor, prefill: bool) -> None:
+    def _issue_prefetches(
+        self, next_position: int, predicted_ids: torch.Tensor, prefill: bool, record_phase=None
+    ) -> None:
+        t0 = time.perf_counter() if record_phase is not None else 0.0
         next_state = self.cache.get_layer(self.registry.layer_names[next_position])
         num_experts = next_state.num_experts
         counts_tensor = torch.bincount(predicted_ids, minlength=num_experts)
@@ -166,6 +178,9 @@ class ImpactDrivenPrefetcher:
             selected = [expert for gain, expert in gains[: self.prefetch_size] if gain > 0]
 
         protected = set(activated) | in_flight
+        if record_phase is not None:
+            record_phase("prefetch.issue_host", t0)
+            t0 = time.perf_counter()
         issued = 0
         for expert in selected:
             # All transfers share the single copy stream: the residency-mirror
@@ -173,6 +188,8 @@ class ImpactDrivenPrefetcher:
             # races on the device-side map.
             self.cache.enqueue_transfer(next_state, expert, protected, self.cache.copy_stream, count_miss=False)
             issued += 1
+        if record_phase is not None:
+            record_phase("prefetch.issue_xfer", t0)
         if issued:
             logger.debug(
                 "HybriMoE prefetch: issued %d expert transfers for %s",

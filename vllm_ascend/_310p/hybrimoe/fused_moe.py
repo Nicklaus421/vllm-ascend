@@ -488,24 +488,35 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                 pair_tokens = torch.arange(num_tokens).repeat_interleave(top_k)
                 for chunk_start in range(0, len(misses), state.num_slots):
                     chunk = misses[chunk_start : chunk_start + state.num_slots]
+                    t_sub = time.perf_counter() if timing else 0.0
                     cache.enqueue_transfers(
                         state, chunk, protected=set(activated), stream=cache.copy_stream, count_miss=False
                     )
                     events = cache.collect_transfer_events(state, chunk)
+                    if timing:
+                        runtime.record_phase("decode.miss_enqueue", t_sub)
+                        t_sub = time.perf_counter()
                     is_chunk = torch.zeros(state.num_experts, dtype=torch.bool)
                     is_chunk[chunk] = True
                     positions = torch.nonzero(is_chunk[flat_ids]).flatten()
                     sel_tokens = pair_tokens[positions]
                     sel_slots = state.expert_to_slot[flat_ids[positions]].to(torch.int32)
                     sel_weights = flat_w_pin[positions]
+                    if timing:
+                        runtime.record_phase("decode.miss_select", t_sub)
+                        t_sub = time.perf_counter()
                     self._compact_top1_forward(state, layer, x, sel_tokens, sel_slots, sel_weights, out, events)
+                    if timing:
+                        runtime.record_phase("decode.miss_compact", t_sub)
         if timing:
             runtime.record_phase("decode.miss_handling", t0)
             t0 = time.perf_counter()
 
         # 6. Impact-driven prefetch for subsequent layers.
         if runtime.prefetcher is not None:
-            runtime.prefetcher.maybe_prefetch(state, x, top_k, scoring_func, prefill=False)
+            runtime.prefetcher.maybe_prefetch(
+                state, x, top_k, scoring_func, prefill=False, record_phase=runtime.record_phase if timing else None
+            )
         if timing:
             runtime.record_phase("decode.prefetch", t0)
             t0 = time.perf_counter()
