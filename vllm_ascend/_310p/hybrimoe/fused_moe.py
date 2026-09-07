@@ -490,7 +490,12 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
                     chunk = misses[chunk_start : chunk_start + state.num_slots]
                     t_sub = time.perf_counter() if timing else 0.0
                     cache.enqueue_transfers(
-                        state, chunk, protected=set(activated), stream=cache.copy_stream, count_miss=False
+                        state,
+                        chunk,
+                        protected=set(activated),
+                        stream=cache.copy_stream,
+                        count_miss=False,
+                        record_phase=runtime.record_phase if timing else None,
                     )
                     events = cache.collect_transfer_events(state, chunk)
                     if timing:

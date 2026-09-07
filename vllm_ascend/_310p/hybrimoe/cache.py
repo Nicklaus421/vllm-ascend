@@ -32,6 +32,8 @@ maps and the in-flight table consistent.
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch_npu
 from vllm.logger import logger
@@ -333,12 +335,14 @@ class HybriMoECache:
         protected: set[int],
         stream,
         count_miss: bool = True,
+        record_phase=None,
     ) -> None:
         """Batch version of enqueue_transfer with vectorized victim selection.
 
         All copies share one completion event (they are stream-ordered anyway);
         consumers must call collect_transfer_events() before using the experts.
         """
+        t0 = time.perf_counter() if record_phase is not None else 0.0
         misses = [e for e in experts if e not in state.in_flight and not state.is_resident(e)]
         if not misses:
             return
@@ -356,9 +360,12 @@ class HybriMoECache:
                         # transfer on device instead of blocking the host.
                         stream.wait_event(stale[1])
             free.extend(victim_slots)
+        if record_phase is not None:
+            record_phase("xfer.victim", t0)
+            t0 = time.perf_counter()
 
         assignments = list(zip(misses, free))
-        self._copy_experts_to_slots(state, assignments, stream, prefetch=False)
+        self._copy_experts_to_slots(state, assignments, stream, prefetch=False, record_phase=record_phase)
         for expert, slot in assignments:
             state.slot_to_expert[slot] = expert
             state.expert_to_slot[expert] = slot
@@ -369,6 +376,8 @@ class HybriMoECache:
             state.in_flight[expert] = (slot, event)
         if count_miss:
             state.misses += len(assignments)
+        if record_phase is not None:
+            record_phase("xfer.mirror_event", t0)
 
     def collect_all_transfer_events(self, state: HybriMoELayerState) -> list:
         """Pop every in-flight transfer event of this layer (pipelined decode)."""
@@ -382,6 +391,7 @@ class HybriMoECache:
         assignments: list[tuple[int, int]],
         stream,
         prefetch: bool,
+        record_phase=None,
     ) -> None:
         """Transfer expert weights host -> NPU slots in NZ format.
 
@@ -394,6 +404,7 @@ class HybriMoECache:
         use_nz = self.use_nz_slots
         batch_params = self._get_batch_params(state, prefetch) if use_nz else None
         staging13, staging2 = self._get_staging(layer, prefetch) if use_nz else (None, None)
+        t0 = time.perf_counter() if record_phase is not None else 0.0
         with torch.npu.stream(stream):
             for start in range(0, len(assignments), _STAGING_ROWS):
                 chunk = assignments[start : start + _STAGING_ROWS]
@@ -411,8 +422,14 @@ class HybriMoECache:
                             [layer.host_w13_int8[e] for e in experts] + [layer.host_w2_int8[e] for e in experts],
                             group="staging_weights",
                         )
+                    if record_phase is not None:
+                        record_phase("xfer.staging_h2d", t0)
+                        t0 = time.perf_counter()
                     nz13 = torch_npu.npu_format_cast(staging13[:n], ACL_FORMAT_FRACTAL_NZ)
                     nz2 = torch_npu.npu_format_cast(staging2[:n], ACL_FORMAT_FRACTAL_NZ)
+                    if record_phase is not None:
+                        record_phase("xfer.nz_cast", t0)
+                        t0 = time.perf_counter()
                     # NOTE: foreach_copy does not support NZ (internal format)
                     # destinations, so the slot NZ blocks go in their own
                     # group; scales are plain-format and share another.
@@ -421,12 +438,18 @@ class HybriMoECache:
                         list(nz13.unbind(0)) + list(nz2.unbind(0)),
                         group="nz_slot_weights",
                     )
+                    if record_phase is not None:
+                        record_phase("xfer.slot_copy", t0)
+                        t0 = time.perf_counter()
                     self._foreach_copy(
                         [layer.w13_weight_scale.data[s] for s in slots]
                         + [layer.w2_weight_scale.data[s] for s in slots],
                         [layer.host_w13_scale[e] for e in experts] + [layer.host_w2_scale[e] for e in experts],
                         group="scales",
                     )
+                    if record_phase is not None:
+                        record_phase("xfer.scales", t0)
+                        t0 = time.perf_counter()
                 else:
                     self._foreach_copy(
                         [layer.w13_weight.data[s] for s in slots]
