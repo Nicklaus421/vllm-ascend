@@ -241,14 +241,16 @@ class NPUPlatform(Platform):
         return min(max_num_seqs * decode_query_len, 512)
 
     @classmethod
-    def _extend_capture_sizes_for_full_decode(cls, vllm_config: VllmConfig) -> None:
-        """Extend user-given cudagraph_capture_sizes to cover full decode batches.
+    def _warn_if_capture_sizes_miss_decode(cls, vllm_config: VllmConfig) -> None:
+        """Warn when cudagraph_capture_sizes don't cover full decode batches.
 
         Capture sizes are token counts, so a uniform decode batch needs up to
-        ``max_num_seqs * (1 + num_speculative_tokens)`` tokens. If the user's
-        list stops below that, decode batches above the largest size silently
-        fall back to eager. Extend the list (keeping multiples of the uniform
-        decode query length so FULL keys stay valid) up to the required max.
+        ``max_num_seqs * (1 + num_speculative_tokens)`` tokens. Decode batches
+        above the largest captured size silently fall back to eager. We only
+        warn (never extend the list implicitly): on memory-tight setups every
+        extra captured size costs graph-pool memory that would otherwise back
+        the KV cache, and starving the KV cache causes preemption storms that
+        are far worse than eager decode.
         """
         compilation_config = vllm_config.compilation_config
         sizes = compilation_config.cudagraph_capture_sizes
@@ -265,20 +267,19 @@ class NPUPlatform(Platform):
         required_max = max_num_seqs * decode_query_len
         if max(sizes) >= required_max:
             return
-        extended = sorted(set(sizes) | set(range(sizes[0], required_max, decode_query_len)) | {required_max})
         logger.warning(
-            "cudagraph_capture_sizes %s do not cover the full decode range "
-            "(max_num_seqs=%d x query_len=%d = %d tokens); extending to %s. "
-            "More capture sizes consume more graph memory; reduce max_num_seqs "
-            "or trim the list if capture fails with OOM.",
+            "cudagraph_capture_sizes %s (token counts!) do not cover the full decode range "
+            "(max_num_seqs=%d x query_len=%d = %d tokens); decode batches larger than %d tokens "
+            "(%d requests) run eagerly. Pass larger sizes (e.g. up to %d) only if the graph memory "
+            "does not starve the KV cache.",
             sizes,
             max_num_seqs,
             decode_query_len,
             required_max,
-            extended,
+            max(sizes),
+            max(sizes) // decode_query_len,
+            required_max,
         )
-        compilation_config.cudagraph_capture_sizes = extended
-        compilation_config.max_cudagraph_capture_size = extended[-1]
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0):
@@ -579,7 +580,7 @@ class NPUPlatform(Platform):
                 )
                 compilation_config.mode = CompilationMode.VLLM_COMPILE
                 compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
-                cls._extend_capture_sizes_for_full_decode(vllm_config)
+                cls._warn_if_capture_sizes_miss_decode(vllm_config)
             elif (
                 ascend_config.hybrimoe_config.graph_mode == "piecewise"
                 or compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE

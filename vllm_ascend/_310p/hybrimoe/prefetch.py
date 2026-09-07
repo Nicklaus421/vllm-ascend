@@ -81,6 +81,12 @@ class ImpactDrivenPrefetcher:
         scoring_func: str,
         prefill: bool = False,
     ) -> None:
+        if prefill:
+            # The streaming prefill path already streams every activated
+            # expert through the slot cache in waves; prefetching mid-prefill
+            # only evicts slots the waves still need and competes with the
+            # demand transfers for H2D bandwidth.
+            return
         self._call_count += 1
         if self._call_count % self.interval != 0:
             return
