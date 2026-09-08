@@ -56,6 +56,10 @@ _STAGING_ROWS = 32
 # that a buffer's previous H2D has completed long before it is rewritten.
 _MIRROR_STAGING_POOL_SIZE = 8
 
+# Number of pinned staging buffer sets for the compact top-1 forward's input
+# H2D; deep enough that back-to-back prefill waves never wait on reuse.
+_COMPACT_STAGING_POOL_SIZE = 8
+
 
 class HybriMoELayerState:
     """Host-side cache state of one MoE layer."""
@@ -100,9 +104,9 @@ class HybriMoELayerState:
         # Event of the last compact top-1 forward; guards dev-buffer reuse.
         self.last_compact_event = None
         # Per-staging-buffer H2D completion events of the compact top-1 path;
-        # guard host-side reuse of the pinned staging buffers (double buffered,
+        # guard host-side reuse of the pinned staging buffers (rotating pool,
         # so a wave/prefetch overlap is preserved).
-        self.last_compact_h2d_events: list = [None, None]
+        self.last_compact_h2d_events: list = [None] * _COMPACT_STAGING_POOL_SIZE
         self.compact_buf_index: int = 0
         # Frozen dispatch parameter objects (constant per layer; avoids
         # re-allocating them on every forward).

@@ -49,7 +49,7 @@ from vllm_ascend._310p.fused_moe.experts_selector import select_experts
 from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310
 from vllm_ascend._310p.fused_moe.moe_mlp import quant_apply_mlp
 from vllm_ascend._310p.fused_moe.token_dispatcher import TokenDispatcherWithAllGather310
-from vllm_ascend._310p.hybrimoe.cache import SENTINEL_SLOT, HybriMoELayerState
+from vllm_ascend._310p.hybrimoe.cache import _COMPACT_STAGING_POOL_SIZE, SENTINEL_SLOT, HybriMoELayerState
 from vllm_ascend._310p.hybrimoe.runtime import HybriMoERuntime
 from vllm_ascend._310p.hybrimoe.scheduler import hss_schedule
 from vllm_ascend._310p.hybrimoe.utils import dequant_int8_per_channel, pin_memory_if_available
@@ -770,12 +770,13 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
         # queued just before. Staging through pinned memory makes the H2D
         # truly asynchronous.
         buf_index = state.compact_buf_index
-        state.compact_buf_index = 1 - buf_index
+        state.compact_buf_index = (buf_index + 1) % _COMPACT_STAGING_POOL_SIZE
         last_h2d = state.last_compact_h2d_events[buf_index]
         if last_h2d is not None and not last_h2d.query():
-            # Host-side reuse guard for the pinned staging. Two buffers are
-            # rotated, so this waits on the H2D from two compact forwards ago,
-            # which has long completed in steady state and never stalls here.
+            # Host-side reuse guard for the pinned staging. Buffers rotate
+            # through a pool, so this waits on the H2D from several compact
+            # forwards ago, which has long completed in steady state and never
+            # stalls here.
             last_h2d.synchronize()
         layer.pin_compact_ids[buf_index][:n].copy_(sel_slots)
         layer.pin_compact_w[buf_index][:n].copy_(sel_weights)
@@ -991,17 +992,21 @@ class AscendHybriMoEFusedMoE310(AscendFusedMoE310):
         self.dev_topk_w = torch.empty(max_tokens * top_k, dtype=self.params_dtype, device="npu")
         # Pair->token index buffer for the wave-streaming (prefill) path.
         self.dev_pair_tokens = torch.empty(max_tokens * top_k, dtype=torch.int64, device="npu")
-        # Pinned staging for the compact top-1 (miss wave) H2D pack, double
-        # buffered so back-to-back waves overlap: copying from pageable tensors
-        # would degrade to a synchronous copy and block the host behind the
-        # expert weight transfers queued on the copy stream.
+        # Pinned staging for the compact top-1 (miss wave) H2D pack, kept in a
+        # small rotating pool so back-to-back waves overlap: copying from
+        # pageable tensors would degrade to a synchronous copy and block the
+        # host behind the expert weight transfers queued on the copy stream.
+        # The pool must be deep enough that a buffer's previous H2D (queued
+        # behind a wave of weight transfers) has completed before reuse.
         self.pin_compact_ids = [
-            pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int32, device="cpu")) for _ in range(2)
+            pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int32, device="cpu"))
+            for _ in range(_COMPACT_STAGING_POOL_SIZE)
         ]
         self.pin_compact_w = [
             pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.float32, device="cpu"))
-            for _ in range(2)
+            for _ in range(_COMPACT_STAGING_POOL_SIZE)
         ]
         self.pin_compact_tokens = [
-            pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int64, device="cpu")) for _ in range(2)
+            pin_memory_if_available(torch.empty(max_tokens * top_k, dtype=torch.int64, device="cpu"))
+            for _ in range(_COMPACT_STAGING_POOL_SIZE)
         ]
