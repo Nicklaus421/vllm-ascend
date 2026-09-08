@@ -41,6 +41,7 @@ from vllm.logger import logger
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 from .config import HybriMoEConfig
+from .utils import pin_memory_if_available
 
 # Sentinel slot for CPU-bound (token, expert) pairs on the NPU side: their
 # routing weight is zeroed, so the sentinel slot's compute contributes
@@ -50,6 +51,10 @@ SENTINEL_SLOT = 0
 # Number of experts processed per H2D -> NZ-cast -> slot-copy chunk; bounds
 # the ND staging memory to a few hundred MB.
 _STAGING_ROWS = 32
+
+# Number of pinned staging buffers for the residency-mirror H2D; large enough
+# that a buffer's previous H2D has completed long before it is rewritten.
+_MIRROR_STAGING_POOL_SIZE = 8
 
 
 class HybriMoELayerState:
@@ -79,6 +84,19 @@ class HybriMoELayerState:
         # side remap without a host sync). Updated on every slot mutation,
         # stream-ordered after the corresponding weight transfer.
         self.dev_expert_to_slot: torch.Tensor | None = None
+        # Pinned snapshots for the mirror H2D, rotated in a small pool. Writing
+        # the device mirror directly from the pageable expert_to_slot would
+        # degrade to a synchronous copy that blocks the host until the copy
+        # stream drains the just-enqueued expert weight transfers. The pool is
+        # sized so that a buffer's previous H2D has long completed by the time
+        # it is rewritten (several waves/layers apart), so the reuse guard
+        # never blocks in steady state.
+        self.pin_mirror = [
+            pin_memory_if_available(torch.empty(num_experts, dtype=torch.int32, device="cpu"))
+            for _ in range(_MIRROR_STAGING_POOL_SIZE)
+        ]
+        self.mirror_h2d_events: list = [None] * _MIRROR_STAGING_POOL_SIZE
+        self.mirror_buf_index: int = 0
         # Event of the last compact top-1 forward; guards dev-buffer reuse.
         self.last_compact_event = None
         # Per-staging-buffer H2D completion events of the compact top-1 path;
@@ -311,9 +329,27 @@ class HybriMoECache:
 
     @staticmethod
     def _write_mirror(state: HybriMoELayerState) -> None:
-        """Mirror the host residency map to the NPU (caller holds the stream)."""
-        if state.dev_expert_to_slot is not None:
-            state.dev_expert_to_slot.copy_(state.expert_to_slot, non_blocking=True)
+        """Mirror the host residency map to the NPU (caller holds the stream).
+
+        The host map is first snapshotted into a pinned staging buffer: a
+        pageable source would make the copy_ degrade to a synchronous copy
+        and block the host until the stream drains the expert weight
+        transfers enqueued just before. The snapshot freezes the content at
+        host time, so later host-side mutations of expert_to_slot cannot tear
+        an in-flight mirror write. Staging buffers rotate through a pool; a
+        buffer is only rewritten after its previous H2D completed (long done
+        in steady state, so the guard never blocks).
+        """
+        if state.dev_expert_to_slot is None:
+            return
+        buf_index = state.mirror_buf_index
+        state.mirror_buf_index = (buf_index + 1) % _MIRROR_STAGING_POOL_SIZE
+        last_h2d = state.mirror_h2d_events[buf_index]
+        if last_h2d is not None and not last_h2d.query():
+            last_h2d.synchronize()
+        state.pin_mirror[buf_index].copy_(state.expert_to_slot)
+        state.dev_expert_to_slot.copy_(state.pin_mirror[buf_index], non_blocking=True)
+        state.mirror_h2d_events[buf_index] = torch.npu.current_stream().record_event()
 
     def collect_transfer_events(self, state: HybriMoELayerState, experts: list[int]) -> list:
         """Events the compute stream must wait on before using `experts`."""

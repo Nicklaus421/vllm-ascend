@@ -359,7 +359,13 @@ class AscendHybriMoEW8A8DynamicScheme310(AscendMoEScheme):
             protected = set().union(*waves[wave_index:])  # current + future waves
             to_load = [e for e in wave if int(state.expert_to_slot[e].item()) < 0 and e not in state.in_flight]
             if to_load:
-                cache.enqueue_transfers(state, to_load, protected, cache.copy_stream)
+                cache.enqueue_transfers(
+                    state,
+                    to_load,
+                    protected,
+                    cache.copy_stream,
+                    record_phase=runtime.record_phase if timing else None,
+                )
             events = cache.collect_transfer_events(state, wave)
 
             # Compact pair selection: exactly this wave's (token, expert) pairs.
