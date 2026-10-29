@@ -597,6 +597,11 @@ class NPUModelRunner(GPUModelRunner):
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
+        # Sparse prefix cache (GDN recurrent-state checkpoints). Lazily built
+        # on first use once the model + KV caches are available.
+        self._sparse_prefix_cache_hook: Any | None = None
+        self._sparse_prefix_cache_initialized: bool = False
+        self._sparse_captured_reqs: set[str] = set()
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -747,6 +752,12 @@ class NPUModelRunner(GPUModelRunner):
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
         """Update cached hybrid-model states after model execution."""
+        # SPARSE-PREFIX-CACHE: capture recurrent-state checkpoints for prompts
+        # that just finished prefilling. Runs before the sync/async split so it
+        # covers both scheduling modes; the state is already committed to its
+        # block during the forward pass.
+        self._maybe_capture_sparse_checkpoints()
+
         if not self.use_async_scheduling:
             return super()._update_states_after_model_execute(
                 output_token_ids, scheduler_output
@@ -785,6 +796,158 @@ class NPUModelRunner(GPUModelRunner):
 
         assert self.num_accepted_tokens_event is not None
         self.num_accepted_tokens_event.record()
+
+    # ------------------------------------------------------------------
+    # Sparse prefix cache (GDN recurrent-state checkpoints)
+    # ------------------------------------------------------------------
+    def _init_sparse_prefix_cache(self) -> None:
+        """Build the sparse prefix cache hook once, guarded by the env flag."""
+        if self._sparse_prefix_cache_initialized:
+            return
+        self._sparse_prefix_cache_initialized = True
+
+        from vllm_ascend import envs
+        from vllm_ascend.core.sparse_prefix_cache import (
+            SparsePrefixCacheCoordinator,
+            SparsePrefixCacheHook,
+            set_sparse_prefix_cache_hook,
+        )
+
+        self._sparse_prefix_cache_hook = None
+        if not envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED:
+            return
+        if not self.model_config.is_hybrid:
+            return
+
+        max_len = self.model_config.max_model_len
+        coordinator = SparsePrefixCacheCoordinator.from_envs(
+            max_len, self._sparse_num_checkpoints()
+        )
+        hook = SparsePrefixCacheHook(
+            coordinator, self.model.get_mamba_state_copy_func()
+        )
+        self._sparse_prefix_cache_hook = hook
+        set_sparse_prefix_cache_hook(hook)
+        logger.info(
+            "Sparse prefix cache enabled (budget=%.2f GB).",
+            float(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_BUDGET_GB),
+        )
+
+    def _sparse_num_checkpoints(self) -> int:
+        """Derive the DP checkpoint budget M from the GDN byte budget.
+
+        TODO(910B): verify the per-checkpoint byte accounting against the real
+        state shapes/layout; this is a first approximation using block-0 bytes.
+        """
+        from vllm_ascend import envs
+
+        per_checkpoint = self._sparse_checkpoint_bytes()
+        if per_checkpoint <= 0:
+            return 4
+        budget_bytes = int(
+            float(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_BUDGET_GB) * 1024 ** 3
+        )
+        return max(1, budget_bytes // per_checkpoint)
+
+    def _sparse_checkpoint_bytes(self) -> int:
+        """Total recurrent + conv state bytes per checkpoint across GDN layers."""
+        total = 0
+        for conv_state, ssm_state in self._mamba_kv_caches_by_layer().values():
+            # State tensors are (num_blocks, ...)-shaped; block 0 is one slice.
+            total += conv_state[0].nelement() * conv_state[0].element_size()
+            total += ssm_state[0].nelement() * ssm_state[0].element_size()
+        return total
+
+    def _mamba_kv_caches_by_layer(self) -> dict[int, tuple[Any, Any]]:
+        """Return ``{GDN layer idx: (conv_state, ssm_state)}``.
+
+        The key is the 0-based index of the linear-attention layer within the
+        Mamba (GDN) group; capture and restore share this enumeration so the
+        checkpoint dicts line up.
+        """
+        forward_context = self.compilation_config.static_forward_context
+        result: dict[int, tuple[Any, Any]] = {}
+        layer_idx = 0
+        for group in self.kv_cache_config.kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, MambaSpec):
+                continue
+            for layer_name in group.layer_names:
+                attention = forward_context[layer_name]
+                # GDN attention.kv_cache == [conv_state, ssm_state].
+                result[layer_idx] = (attention.kv_cache[0], attention.kv_cache[1])
+                layer_idx += 1
+        return result
+
+    def _sparse_mamba_group_id(self) -> int | None:
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                return gid
+        return None
+
+    def _sparse_block_ids(self, req_idx: int) -> list[int] | None:
+        mamba_gid = self._sparse_mamba_group_id()
+        if mamba_gid is None:
+            return None
+        block_table = self.input_batch.block_table[mamba_gid].get_numpy_array()
+        if req_idx >= block_table.shape[0]:
+            return None
+        return [int(b) for b in block_table[req_idx]]
+
+    def _maybe_restore_sparse_checkpoints(self) -> None:
+        """Restore pending sparse checkpoints before the forward pass."""
+        self._init_sparse_prefix_cache()
+        hook = self._sparse_prefix_cache_hook
+        if hook is None:
+            return
+        kv_caches_by_layer = self._mamba_kv_caches_by_layer()
+        if not kv_caches_by_layer:
+            return
+        block_size = hook.coordinator.block_size
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            hit = hook.coordinator.take_pending_hit(tuple(req_state.block_hashes))
+            if hit is None:
+                continue
+            block_ids = self._sparse_block_ids(i)
+            if block_ids is None:
+                continue
+            # TODO(910B): confirm dest_block_idx matches the block that
+            # ``prefill_state_indices`` (post ``mamba_get_block_table_tensor``)
+            # points at for mamba_cache_mode='all'.
+            dest_block_idx = hit.checkpoint_position // block_size - 1
+            if dest_block_idx < 0 or dest_block_idx >= len(block_ids):
+                continue
+            hook.restore(hit, kv_caches_by_layer, block_ids, dest_block_idx)
+
+    def _maybe_capture_sparse_checkpoints(self) -> None:
+        """Capture sparse checkpoints for prompts that just finished prefilling."""
+        self._init_sparse_prefix_cache()
+        hook = self._sparse_prefix_cache_hook
+        if hook is None:
+            return
+        kv_caches_by_layer = self._mamba_kv_caches_by_layer()
+        if not kv_caches_by_layer:
+            return
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            if req_id in self._sparse_captured_reqs:
+                continue
+            if req_state.num_computed_tokens < req_state.num_tokens:
+                continue  # still prefilling
+            block_ids = self._sparse_block_ids(i)
+            if block_ids is None:
+                continue
+            hook.capture(
+                tuple(req_state.block_hashes),
+                req_state.num_computed_tokens,
+                kv_caches_by_layer,
+                block_ids,
+            )
+            self._sparse_captured_reqs.add(req_id)
 
     def _remap_num_accepted_tokens(self, num_reqs: int) -> None:
         """Map the previous iteration's accepted counts to current rows."""
@@ -2194,6 +2357,12 @@ class NPUModelRunner(GPUModelRunner):
                             self.requests,
                             self.mamba_state_idx,
                         )
+
+                # SPARSE-PREFIX-CACHE: materialize any pending sparse checkpoint
+                # into the sequence's state block before the forward so the GDN
+                # kernel reads the restored recurrent state as initial_state.
+                self._maybe_restore_sparse_checkpoints()
+
                 if self.use_compress:
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()

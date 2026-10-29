@@ -110,6 +110,41 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable sparse prefix caching for hybrid (attention + recurrent)
+    # models. When enabled, the GatedDeltaNet recurrent state is checkpointed at
+    # a sparse set of DP-optimal positions instead of every block.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED", "0"))
+    ),
+    # Checkpoint placement strategy. Only "hist_exp_decay" (DP-optimal) is
+    # implemented; anything else falls back to frozen balanced placement.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY": lambda: os.getenv(
+        "VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY", "hist_exp_decay"
+    ),
+    # Byte budget (GB) for the GDN recurrent-state checkpoint store.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_BUDGET_GB": lambda: float(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_BUDGET_GB", "1.0")
+    ),
+    # Bin size (tokens) used to discretize the overlap-depth histogram.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_BIN_SIZE": lambda: int(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_BIN_SIZE", "16")
+    ),
+    # Exponential decay factor for the drift-following histogram.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_GAMMA": lambda: float(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_GAMMA", "0.99")
+    ),
+    # Number of observations between DP re-solves.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_REPLAN_INTERVAL": lambda: int(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_REPLAN_INTERVAL", "100")
+    ),
+    # Laplace smoothing constant applied to the overlap histogram.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_LAPLACE_ALPHA": lambda: float(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_LAPLACE_ALPHA", "1.0")
+    ),
+    # Block size (tokens) that checkpoint positions are clipped down to.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE": lambda: int(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE", "16")
+    ),
 }
 
 # end-env-vars-definition

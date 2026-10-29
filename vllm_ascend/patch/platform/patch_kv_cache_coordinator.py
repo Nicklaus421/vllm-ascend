@@ -57,6 +57,31 @@ def _is_deepseek_v4_kv_cache_config(kv_cache_config: KVCacheConfig) -> bool:
     return any(_is_deepseek_v4_kv_cache_spec(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups)
 
 
+def _resolve_sparse_mamba_hit(
+    block_hashes: list[BlockHash],
+    overlap_depth: int,
+) -> int | None:
+    """Resolve the sparse recurrent-state hit length for a Mamba group.
+
+    Returns ``None`` when sparse prefix caching is disabled (the caller falls
+    back to the dense Mamba block pool); otherwise returns the nearest
+    checkpoint position ``C <= overlap_depth`` (``0`` when no checkpoint is
+    cached for this prefix). On a positive hit the checkpoint is registered so
+    the worker restores it before the recompute prefill.
+    """
+    from vllm_ascend.core.sparse_prefix_cache import get_sparse_prefix_cache_hook
+
+    hook = get_sparse_prefix_cache_hook()
+    if hook is None:
+        return None
+    prefix_key = tuple(block_hashes)
+    hit = hook.resolve(prefix_key, overlap_depth)
+    if hit is None:
+        return 0
+    hook.coordinator.register_pending_hit(prefix_key, hit)
+    return hit.checkpoint_position
+
+
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
     """
     KV cache coordinator for hybrid models with multiple KV cache types, and
@@ -287,6 +312,21 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         while True:
             curr_hit_length = hit_length
             for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
+                # SPARSE-PREFIX-CACHE: the recurrent state is only checkpointed
+                # at a sparse set of positions, so the Mamba group's hit is the
+                # nearest checkpoint C <= curr_hit_length, not a dense block run.
+                # Rewinding the hybrid hit length to C makes the scheduler emit
+                # a chunked prefill over [C, P) with the restored initial state.
+                if isinstance(spec, MambaSpec):
+                    sparse_hit_length = _resolve_sparse_mamba_hit(
+                        block_hashes, curr_hit_length
+                    )
+                    if sparse_hit_length is not None:
+                        curr_hit_length = sparse_hit_length
+                        for group_id in group_ids:
+                            hit_blocks_by_group[group_id] = []
+                        continue
+
                 effective_block_size = self._get_effective_block_size(spec)
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
