@@ -48,8 +48,9 @@ class SparsePrefixCache:
     """FIFO cache of sparse recurrent checkpoints under a GDN byte budget.
 
     Entries are keyed by an opaque hashable prefix identity (the coordinator
-    uses the same block-hash chain that vLLM's prefix cache uses). Lookup
-    returns the nearest checkpoint at or before ``seq_len``.
+    uses the token-id prefix ``tuple(prompt_token_ids[:seq_len])``, which both
+    the scheduler and the worker can produce). Lookup returns the nearest
+    checkpoint at or before ``seq_len``.
 
     Not thread-safe: it is meant to be driven by the single-threaded scheduler
     loop, matching the reference implementation.

@@ -132,29 +132,37 @@ The three call sites, against the vllm-ascend v1 runner:
    (`_update_states_after_model_execute`, entry point `_maybe_capture_sparse_checkpoints`),
    after the recurrent state is committed to its block during the forward, call
    `hook.capture(prefix_key, seq_len, kv_caches_by_layer, block_ids)`.
-   `block_ids` is the request's mamba block table; the state after token `pos`
-   lives in `block_ids[pos // block_size - 1]`. Multi-position capture requires
+   `prefix_key = tuple(req_state.prompt_token_ids)`; `block_ids` is the request's
+   mamba block table, where the state after token `pos` lives in
+   `block_ids[pos // block_size - 1]`. Multi-position capture requires
    `mamba_cache_mode='all'` (block-indexed recurrent state).
 
 2. **Hit resolution** — in `vllm_ascend/patch/platform/patch_kv_cache_coordinator.py`
    (`AscendHybridKVCacheCoordinator.find_longest_cache_hit`), the full-attention
    group already yields the dense overlap depth `P`. For the Mamba group,
-   `_resolve_sparse_mamba_hit(block_hashes, P)` consults
-   `hook.resolve(prefix_key, P)` instead of the dense block pool; the resulting
-   `checkpoint_position` `C` is the mamba hit length, so the hybrid
+   `_resolve_sparse_mamba_hit(P, request_id, prompt_token_ids)` consults
+   `hook.resolve(prefix_key, P)` with
+   `prefix_key = tuple(prompt_token_ids[:P])` instead of the dense block pool;
+   the resulting `checkpoint_position` `C` is the mamba hit length, so the hybrid
    `num_computed_tokens` is rewound to `C`. The resolved `SparseHit` is recorded
-   as a *pending hit* keyed by `prefix_key` (the block-hash chain) for the
-   worker to consume.
+   as a *pending hit* keyed by `request_id` for the worker to consume.
 
 3. **Restore + recompute** — in `vllm_ascend/worker/model_runner_v1.py`
    (`execute_model`, `_maybe_restore_sparse_checkpoints`, before the forward), a
-   pending hit is popped by `prefix_key` and `hook.restore(...)` copies the
+   pending hit is popped by `req_id` and `hook.restore(...)` copies the
    checkpoint into the sequence's state block (`dest_block_idx =
    C // block_size - 1`). `vllm_ascend/ops/gdn.py`
    (`AscendGatedDeltaNetAttention._forward_core`) then reads the restored
    `initial_state = ssm_state[prefill_state_indices]` and runs
    `chunk_gated_delta_rule(initial_state=...)` over `[C, P)` exactly as the
    existing resume path does.
+
+   The store is keyed by the *token prefix* (`tuple(prompt_token_ids[:len])`),
+   not `block_hashes`, because the worker-side `CachedRequestState` exposes
+   `prompt_token_ids`/`req_id` but not `block_hashes`. `request_id` and
+   `prompt_token_ids` are handed to the coordinator by a small patch on
+   `KVCacheManager.get_computed_blocks` (which stashes them on the coordinator
+   before calling `find_longest_cache_hit`).
 
 `vllm_ascend/ops/gdn_attn_builder.py`
 (`AscendGDNAttentionMetadataBuilder.build`) is where `common_prefix_len`,

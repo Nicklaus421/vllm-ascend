@@ -104,8 +104,10 @@ class SparsePrefixCacheCoordinator:
         self.block_size = max(1, block_size)
         # Sparse hits resolved by the KV-cache coordinator that still need their
         # checkpoint materialized by the worker before the recompute prefill.
-        # Keyed by the prefix identity (the block-hash chain).
-        self._pending_hits: dict[Hashable, SparseHit] = {}
+        # Keyed by request id: it is available on both the scheduler side
+        # (``Request.request_id``) and the worker side (``req_id``), whereas
+        # ``block_hashes`` is a scheduler-only concept.
+        self._pending_hits: dict[str, SparseHit] = {}
 
     @classmethod
     def from_envs(
@@ -230,13 +232,13 @@ class SparsePrefixCacheCoordinator:
     # ------------------------------------------------------------------
     # Pending-hit handoff (coordinator -> worker)
     # ------------------------------------------------------------------
-    def register_pending_hit(self, prefix_key: Hashable, hit: SparseHit) -> None:
+    def register_pending_hit(self, request_id: str, hit: SparseHit) -> None:
         """Record a resolved hit whose checkpoint must be restored by the worker."""
-        self._pending_hits[prefix_key] = hit
+        self._pending_hits[request_id] = hit
 
-    def take_pending_hit(self, prefix_key: Hashable) -> SparseHit | None:
-        """Pop (and thus consume) a pending hit for ``prefix_key``, if any."""
-        return self._pending_hits.pop(prefix_key, None)
+    def take_pending_hit(self, request_id: str) -> SparseHit | None:
+        """Pop (and thus consume) a pending hit for ``request_id``, if any."""
+        return self._pending_hits.pop(request_id, None)
 
     def stats(self) -> dict[str, object]:
         return {

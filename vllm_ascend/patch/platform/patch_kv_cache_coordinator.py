@@ -58,27 +58,36 @@ def _is_deepseek_v4_kv_cache_config(kv_cache_config: KVCacheConfig) -> bool:
 
 
 def _resolve_sparse_mamba_hit(
-    block_hashes: list[BlockHash],
     overlap_depth: int,
+    request_id: str | None,
+    prompt_token_ids: list[int] | None,
 ) -> int | None:
     """Resolve the sparse recurrent-state hit length for a Mamba group.
 
     Returns ``None`` when sparse prefix caching is disabled (the caller falls
-    back to the dense Mamba block pool); otherwise returns the nearest
-    checkpoint position ``C <= overlap_depth`` (``0`` when no checkpoint is
-    cached for this prefix). On a positive hit the checkpoint is registered so
-    the worker restores it before the recompute prefill.
+    back to the dense Mamba block pool) or when the request identity/tokens are
+    unavailable; otherwise returns the nearest checkpoint position ``C <=
+    overlap_depth`` (``0`` when no checkpoint is cached for this prefix). On a
+    positive hit the checkpoint is registered under ``request_id`` so the worker
+    restores it before the recompute prefill.
+
+    The store is keyed by the token prefix (``prompt_token_ids[:overlap_depth]``)
+    rather than ``block_hashes`` because the worker-side ``CachedRequestState``
+    exposes ``prompt_token_ids`` but not ``block_hashes`` (which is a
+    scheduler-only concept).
     """
     from vllm_ascend.core.sparse_prefix_cache import get_sparse_prefix_cache_hook
 
     hook = get_sparse_prefix_cache_hook()
     if hook is None:
         return None
-    prefix_key = tuple(block_hashes)
+    if request_id is None or prompt_token_ids is None:
+        return None
+    prefix_key = tuple(prompt_token_ids[:overlap_depth])
     hit = hook.resolve(prefix_key, overlap_depth)
     if hit is None:
         return 0
-    hook.coordinator.register_pending_hit(prefix_key, hit)
+    hook.coordinator.register_pending_hit(request_id, hit)
     return hit.checkpoint_position
 
 
@@ -319,7 +328,9 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 # a chunked prefill over [C, P) with the restored initial state.
                 if isinstance(spec, MambaSpec):
                     sparse_hit_length = _resolve_sparse_mamba_hit(
-                        block_hashes, curr_hit_length
+                        curr_hit_length,
+                        getattr(self, "_sparse_request_id", None),
+                        getattr(self, "_sparse_prompt_token_ids", None),
                     )
                     if sparse_hit_length is not None:
                         curr_hit_length = sparse_hit_length
@@ -562,5 +573,28 @@ vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator = get_kv_cache_coordi
 # (for example through the recompute scheduler path), it keeps the
 # old function object. Update that cached binding as well.
 _kv_cache_manager = sys.modules.get("vllm.v1.core.kv_cache_manager")
-if _kv_cache_manager is not None:
-    _kv_cache_manager.get_kv_cache_coordinator = get_kv_cache_coordinator  # type: ignore[attr-defined]
+if _kv_cache_manager is None:
+    import vllm.v1.core.kv_cache_manager as _kv_cache_manager  # noqa: E402
+_kv_cache_manager.get_kv_cache_coordinator = get_kv_cache_coordinator  # type: ignore[attr-defined]
+
+# Thread the request identity + token ids into the coordinator before
+# ``find_longest_cache_hit`` runs. Upstream only forwards ``block_hashes``
+# (a scheduler-only concept), but the sparse prefix cache keys its store by
+# ``prompt_token_ids`` and its pending-hit handoff by ``request_id`` because
+# the worker-side ``CachedRequestState`` carries those, not ``block_hashes``.
+_orig_get_computed_blocks = _kv_cache_manager.KVCacheManager.get_computed_blocks
+
+
+def _patched_get_computed_blocks(self, request):
+    coordinator = getattr(self, "coordinator", None)
+    if coordinator is not None:
+        try:
+            coordinator._sparse_request_id = request.request_id
+            coordinator._sparse_prompt_token_ids = request.prompt_token_ids
+        except Exception:
+            # Coordinators that don't carry sparse state ignore the handoff.
+            pass
+    return _orig_get_computed_blocks(self, request)
+
+
+_kv_cache_manager.KVCacheManager.get_computed_blocks = _patched_get_computed_blocks  # type: ignore[attr-defined]

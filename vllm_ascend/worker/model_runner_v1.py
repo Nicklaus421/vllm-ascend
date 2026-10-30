@@ -907,7 +907,7 @@ class NPUModelRunner(GPUModelRunner):
             req_state = self.requests.get(req_id)
             if req_state is None:
                 continue
-            hit = hook.coordinator.take_pending_hit(tuple(req_state.block_hashes))
+            hit = hook.coordinator.take_pending_hit(req_id)
             if hit is None:
                 continue
             block_ids = self._sparse_block_ids(i)
@@ -938,11 +938,13 @@ class NPUModelRunner(GPUModelRunner):
                 continue
             if req_state.num_computed_tokens < req_state.num_tokens:
                 continue  # still prefilling
+            if req_state.prompt_token_ids is None:
+                continue  # prompt-embed request: no token-id prefix key
             block_ids = self._sparse_block_ids(i)
             if block_ids is None:
                 continue
             hook.capture(
-                tuple(req_state.block_hashes),
+                tuple(req_state.prompt_token_ids),
                 req_state.num_computed_tokens,
                 kv_caches_by_layer,
                 block_ids,
