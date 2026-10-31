@@ -22,6 +22,7 @@ from vllm_ascend.core.sparse_prefix_cache.checkpoint import (
 from vllm_ascend.core.sparse_prefix_cache.coordinator import (
     SparseHit,
     SparsePrefixCacheCoordinator,
+    get_checkpoint_positions,
 )
 from vllm_ascend.core.sparse_prefix_cache.runner import (
     SparsePrefixCacheHook,
@@ -29,6 +30,13 @@ from vllm_ascend.core.sparse_prefix_cache.runner import (
     get_sparse_prefix_cache_hook,
     restore_checkpoint_state,
     set_sparse_prefix_cache_hook,
+)
+from vllm_ascend.core.sparse_prefix_cache.shared import (
+    attach_sparse_shared_state,
+    get_sparse_positions,
+    get_sparse_shared_state,
+    init_sparse_shared_state,
+    publish_sparse_positions,
 )
 from vllm_ascend.core.sparse_prefix_cache.store import SparsePrefixCache
 from vllm_ascend.core.sparse_prefix_cache.strategies import (
@@ -48,12 +56,18 @@ __all__ = [
     "SparsePrefixCache",
     "SparsePrefixCacheCoordinator",
     "SparsePrefixCacheHook",
+    "attach_sparse_shared_state",
     "backtrack",
     "balanced_positions",
     "fixed_interval_positions",
     "capture_checkpoint_state",
+    "get_checkpoint_positions",
+    "get_sparse_positions",
     "get_sparse_prefix_cache_hook",
+    "get_sparse_shared_state",
+    "init_sparse_shared_state",
     "laplace_smoothing",
+    "publish_sparse_positions",
     "restore_checkpoint_state",
     "set_sparse_prefix_cache_hook",
     "solve_dp",

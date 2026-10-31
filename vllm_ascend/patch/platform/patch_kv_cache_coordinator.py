@@ -7,6 +7,7 @@ from math import lcm
 import vllm
 import vllm.envs as envs_vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
+from vllm.logger import logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
@@ -74,13 +75,11 @@ def _resolve_sparse_mamba_hit(overlap_depth: int) -> int | None:
     (see ``model_runner_v1.py``), keyed by ``tuple(prompt_token_ids[:C])``.
     """
     from vllm_ascend import envs
-    from vllm_ascend.core.sparse_prefix_cache import fixed_interval_positions
+    from vllm_ascend.core.sparse_prefix_cache import get_checkpoint_positions
 
     if not envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED:
         return None
-    interval = int(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL)
-    block_size = int(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE)
-    positions = fixed_interval_positions(overlap_depth, interval, block_size)
+    positions = get_checkpoint_positions(overlap_depth)
     return positions[-1] if positions else 0
 
 
@@ -184,6 +183,109 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 mgr.scheduler_block_size = self.lcm_block_size
 
         self.use_eagle = use_eagle
+
+        # Sparse prefix cache (v2): DP-optimal placement state, owned by the
+        # EngineCore process and shared with TP workers via a Manager proxy.
+        self._sparse_tracker = None
+        self._sparse_solved = False
+        self._sparse_warmup_requests = 0
+        self._sparse_block_size = 0
+        self._init_sparse_hist_tracker()
+
+    def _init_sparse_hist_tracker(self) -> None:
+        """Initialize the DP overlap histogram for ``hist_exp_decay`` (v2).
+
+        The tracker is owned by the EngineCore process; it accumulates overlap
+        depths observed in :meth:`find_longest_cache_hit` and solves the DP once
+        after a warmup, publishing the frozen, prefix-consistent positions to
+        the Manager-backed shared state read by the TP workers.
+        """
+        from vllm_ascend import envs
+        from vllm_ascend.core.sparse_prefix_cache.shared import (
+            init_sparse_shared_state,
+        )
+        from vllm_ascend.core.sparse_prefix_cache.strategies import (
+            HistogramTracker,
+        )
+
+        if not envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED:
+            return
+        if envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY != "hist_exp_decay":
+            return
+
+        # Create the Manager proxy in this (EngineCore) process; workers
+        # re-attach it via process_kwargs (see patch_multiproc_executor.py).
+        init_sparse_shared_state()
+
+        self._sparse_tracker = HistogramTracker(
+            max_len=self.max_model_len,
+            budget=int(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_NUM_CHECKPOINTS),
+            mode="frozen",
+            gamma=float(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_GAMMA),
+            replan_interval=int(
+                envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_REPLAN_INTERVAL
+            ),
+            alpha=float(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_LAPLACE_ALPHA),
+            bin_size=int(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_BIN_SIZE),
+            # Prefix-consistent backtracking: solve once and freeze a fixed set
+            # of positions so capture (worker) and resolve (coordinator) agree
+            # across processes with zero per-prefix bookkeeping.
+            adaptive_backtrack=False,
+        )
+        self._sparse_warmup_requests = int(
+            envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_WARMUP_REQUESTS
+        )
+        self._sparse_block_size = int(
+            envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE
+        )
+
+    def _observe_sparse_hit(self, overlap_depth: int) -> None:
+        """Feed an observed overlap depth into the DP histogram.
+
+        Once the warmup threshold is reached, solve the DP once, clip the
+        positions to block boundaries and publish them to the workers. After
+        that this becomes a no-op (frozen placement).
+        """
+        tracker = self._sparse_tracker
+        if tracker is None or self._sparse_solved:
+            return
+        tracker.observe(overlap_depth)
+        if tracker.n_obs < self._sparse_warmup_requests:
+            return
+        tracker.solve()
+        self._sparse_solved = True
+        fixed = tracker._fixed_positions
+        positions = self._clip_sparse_positions(fixed) if fixed else []
+        if not positions:
+            # Degenerate/empty histogram: keep the fixed_interval warmup
+            # fallback rather than publishing an empty placement.
+            logger.warning(
+                "Sparse prefix cache: DP solve produced no usable checkpoint "
+                "positions; keeping the fixed_interval warmup placement."
+            )
+            return
+        from vllm_ascend.core.sparse_prefix_cache.shared import (
+            publish_sparse_positions,
+        )
+
+        publish_sparse_positions(positions)
+        logger.info(
+            "Sparse prefix cache: solved DP placement after %d observations "
+            "(%d checkpoints: %s).",
+            tracker.n_obs,
+            len(positions),
+            positions,
+        )
+
+    def _clip_sparse_positions(self, positions: list[int]) -> list[int]:
+        """Clip DP positions down to block boundaries and de-duplicate."""
+        clipped: list[int] = []
+        for pos in positions:
+            c = (pos // self._sparse_block_size) * self._sparse_block_size
+            if c <= 0 or c in clipped:
+                continue
+            clipped.append(c)
+        return sorted(clipped)
 
     def _get_effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
         block_size = kv_cache_spec.block_size
@@ -320,6 +422,11 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 # Rewinding the hybrid hit length to C makes the scheduler emit
                 # a chunked prefill over [C, P) with the restored initial state.
                 if isinstance(spec, MambaSpec):
+                    if self._sparse_tracker is not None:
+                        # Feed the dense full-attention overlap depth (P) into
+                        # the DP histogram. Full attention is always processed
+                        # first, so ``curr_hit_length`` is P here.
+                        self._observe_sparse_hit(curr_hit_length)
                     sparse_hit_length = _resolve_sparse_mamba_hit(curr_hit_length)
                     if sparse_hit_length is not None:
                         curr_hit_length = sparse_hit_length

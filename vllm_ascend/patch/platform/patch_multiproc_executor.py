@@ -20,6 +20,27 @@ from vllm.v1.executor.multiproc_executor import (
     set_multiprocessing_worker_envs,
 )
 
+_orig_worker_main = WorkerProc.worker_main
+
+
+def _ascend_worker_main(**kwargs):
+    """Worker entry point that re-attaches the sparse-cache shared state.
+
+    Under ``spawn`` the worker process re-imports this module fresh, so the
+    ``multiprocessing.Manager`` proxy holding the DP-optimal checkpoint
+    positions must be handed over explicitly through ``process_kwargs``; under
+    ``fork`` the module singleton is inherited anyway and re-attaching the same
+    proxy is idempotent.
+    """
+    sparse_shared_state = kwargs.pop("sparse_shared_state", None)
+    if sparse_shared_state is not None:
+        from vllm_ascend.core.sparse_prefix_cache.shared import (
+            attach_sparse_shared_state,
+        )
+
+        attach_sparse_shared_state(sparse_shared_state)
+    return _orig_worker_main(**kwargs)
+
 
 class AscendMultiprocExecutor(MultiprocExecutor):
     def _init_executor(self) -> None:
@@ -191,9 +212,30 @@ class AscendWorkerProc(WorkerProc):
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
+
+        # Hand the sparse-prefix-cache Manager proxy to the worker so the
+        # DP-optimal checkpoint positions are visible in the worker process.
+        # ``init_sparse_shared_state`` is idempotent, so this is robust to the
+        # coordinator/executor init order: whichever runs first creates the
+        # proxy, and both share the same module singleton. ``None`` when sparse
+        # caching is disabled or the fixed_interval strategy is in use.
+        from vllm_ascend import envs
+
+        sparse_shared_state = None
+        if (
+            envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED
+            and envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY == "hist_exp_decay"
+        ):
+            from vllm_ascend.core.sparse_prefix_cache.shared import (
+                init_sparse_shared_state,
+            )
+
+            sparse_shared_state = init_sparse_shared_state()
+        process_kwargs["sparse_shared_state"] = sparse_shared_state
+
         # Run EngineCore busy loop in background process.
         proc = context.Process(
-            target=WorkerProc.worker_main,
+            target=_ascend_worker_main,
             kwargs=process_kwargs,
             name=f"VllmWorker-{rank}",
             daemon=False,

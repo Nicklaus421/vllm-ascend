@@ -199,7 +199,7 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSl
 from vllm_ascend.core.sparse_prefix_cache import (
     RecurrentCheckpoint,
     capture_checkpoint_state,
-    fixed_interval_positions,
+    get_checkpoint_positions,
     restore_checkpoint_state,
 )
 
@@ -935,7 +935,6 @@ class NPUModelRunner(GPUModelRunner):
         kv_caches_by_layer = self._mamba_kv_caches_by_layer()
         if not kv_caches_by_layer:
             return
-        interval = self._sparse_checkpoint_interval
         block_size = self._sparse_block_size
         for i, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests.get(req_id)
@@ -950,7 +949,7 @@ class NPUModelRunner(GPUModelRunner):
             if block_ids is None:
                 continue
             seq_len = len(prompt)
-            for pos in fixed_interval_positions(seq_len, interval, block_size):
+            for pos in get_checkpoint_positions(seq_len):
                 src_block_idx = pos // block_size - 1
                 if src_block_idx < 0 or src_block_idx >= len(block_ids):
                     continue

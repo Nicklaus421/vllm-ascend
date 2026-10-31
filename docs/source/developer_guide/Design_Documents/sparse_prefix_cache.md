@@ -44,11 +44,22 @@ compatibility):
 | `balanced` | `n_blocks` evenly spaced |
 | `sqrt` | `sqrt(L)`-spaced |
 | `dyadic` | Positions at powers of two |
+| `fixed_interval` | Fixed token interval (prefix-consistent, cross-process safe) |
 | `hist_exp_decay` | DP-optimal on the empirical overlap distribution with exponential reweighting for drift |
 
-vLLM Ascend implements the DP-optimal `hist_exp_decay` strategy (the paper's
-core contribution, Corollary 1). Simpler strategies are retained as the
-fallback used before the first DP solve.
+The v1 implementation ships the deterministic `fixed_interval` strategy (the
+default). It is prefix-consistent — positions are fixed multiples of the
+interval, so the scheduler-side coordinator and the TP workers derive identical
+checkpoint positions from the environment alone, with no cross-process state.
+
+The DP-optimal `hist_exp_decay` strategy (the paper's core contribution,
+Corollary 1) is implemented in v2. The overlap-depth histogram accumulates in
+the EngineCore process (scheduler-side coordinator), the DP is solved once after
+a warmup and frozen, and the resulting prefix-consistent checkpoint positions
+are published to the TP workers through a `multiprocessing.Manager` proxy
+(`shared.py`). Until the first solve, `hist_exp_decay` falls back to the
+deterministic `fixed_interval` placement, so it is always cross-process
+consistent.
 
 ## Architecture
 
@@ -64,7 +75,8 @@ vllm_ascend/core/sparse_prefix_cache/
 ├── strategies.py     # DP solver + HistogramTracker + balanced fallback
 ├── checkpoint.py     # RecurrentCheckpoint / PrefixCheckpointStore
 ├── store.py          # budgeted FIFO cache (KV budget + GDN budget)
-└── coordinator.py    # hit -> (hit_pos, checkpoint_pos) -> trigger recompute
+├── coordinator.py    # hit -> (hit_pos, checkpoint_pos) -> trigger recompute
+└── shared.py         # Manager-backed cross-process DP placement (v2)
 ```
 
 ### Recompute path
@@ -90,7 +102,8 @@ reading the cached KV for `[0, C)`.
 Environment variables are defined centrally in `vllm_ascend/envs.py`:
 
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED`
-- `VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY` (`hist_exp_decay`)
+- `VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY` (`fixed_interval` default;
+  `hist_exp_decay` for DP-optimal v2 placement)
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_BUDGET_GB`
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_BIN_SIZE`
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_GAMMA`
@@ -100,6 +113,11 @@ Environment variables are defined centrally in `vllm_ascend/envs.py`:
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL` (v1 fixed-interval
   placement, default 256; prefix-consistent so the coordinator and TP worker
   agree on `C` without cross-process state)
+- `VLLM_ASCEND_SPARSE_PREFIX_CACHE_WARMUP_REQUESTS` (v2, default 100; number
+  of observed cache hits before the DP is solved once and frozen)
+- `VLLM_ASCEND_SPARSE_PREFIX_CACHE_NUM_CHECKPOINTS` (v2, default 16; the DP
+  checkpoint budget `M`, sized so `M * recurrent_state_bytes` fits the memory
+  budget)
 
 ## How It Works
 
@@ -129,12 +147,18 @@ eviction; GDN checkpoints are evicted from the smallest position first.
 The pure orchestration is in `vllm_ascend/core/sparse_prefix_cache/`; the tensor
 plumbing is `runner.py` (`capture_checkpoint_state` / `restore_checkpoint_state`),
 which reuses vLLM's `MambaStateCopyFunc` machinery to move state between live
-blocks and the store. The v1 implementation is **cross-process safe**: the
-scheduler-side coordinator and the TP workers run in separate processes, so
-instead of sharing a store they both derive checkpoint positions from the same
-deterministic, prefix-consistent fixed-interval placement
-(`fixed_interval_positions`), and the worker keeps its own per-process state
-buffer keyed by the token prefix.
+blocks and the store. Both v1 (`fixed_interval`) and v2 (`hist_exp_decay`) are
+**cross-process safe**: the scheduler-side coordinator and the TP workers run in
+separate processes, so instead of sharing a store they both derive checkpoint
+positions from the same deterministic, prefix-consistent placement, and the
+worker keeps its own per-process state buffer keyed by the token prefix.
+
+- **v1** derives positions from the stateless `fixed_interval_positions` (no
+  shared state).
+- **v2** accumulates the overlap histogram in the coordinator, solves the DP
+  once after a warmup, freezes the positions, and publishes them to the workers
+  through a `multiprocessing.Manager` proxy (`shared.py`); both sides read the
+  same frozen list via `get_checkpoint_positions(seq_len)`.
 
 1. **Capture after prefill** — in `vllm_ascend/worker/model_runner_v1.py`
    (`_update_states_after_model_execute`, entry point `_maybe_capture_sparse_checkpoints`),
@@ -148,10 +172,13 @@ buffer keyed by the token prefix.
 2. **Hit resolution** — in `vllm_ascend/patch/platform/patch_kv_cache_coordinator.py`
    (`AscendHybridKVCacheCoordinator.find_longest_cache_hit`), the full-attention
    group already yields the dense overlap depth `P`. For the Mamba group,
-   `_resolve_sparse_mamba_hit(P)` recomputes the fixed-interval positions up to
-   `P` and returns the largest `C <= P` (`0` when none), rewinding the hybrid
-   `num_computed_tokens` to `C`. No store, request identity, or cross-process
-   handoff is involved.
+   `_resolve_sparse_mamba_hit(P)` returns the largest checkpoint `C <= P` (`0`
+   when none), rewinding the hybrid `num_computed_tokens` to `C`. For v2, the
+   coordinator also feeds `P` into the DP histogram via `_observe_sparse_hit(P)`
+   (full attention is always processed first, so `P` is the dense overlap depth)
+   and, once the warmup threshold is reached, solves the DP once, clips the
+   positions to block boundaries, and publishes them to the workers through
+   `shared.py`.
 
 3. **Restore + recompute** — in `vllm_ascend/worker/model_runner_v1.py`
    (`execute_model`, `_maybe_restore_sparse_checkpoints`, before the forward), the
@@ -175,14 +202,40 @@ buffer keyed by the token prefix.
 coordinator's reduced `hit_length` (`num_computed_tokens = C`), so no change is
 needed there.
 
-The v1 placement is a fixed interval
-(`VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL`, default 256) clipped to
-block boundaries. It is prefix-consistent: the positions for a hit of length `P`
-are exactly the subset of the positions for the longer originally-captured
-prefix, so the coordinator and worker always agree on `C` with zero
-cross-process communication. The DP-optimal `hist_exp_decay` strategy (v2)
-additionally needs to synchronize the overlap histogram across processes and use
-a prefix-consistent backtracking mode; it reuses the same capture/restore buffer.
+Both the coordinator and worker call the shared `get_checkpoint_positions(seq_len)`
+entry point, which dispatches on the configured strategy. `fixed_interval` is
+prefix-consistent: the positions for a hit of length `P` are exactly the subset
+of the positions for the longer originally-captured prefix, so the coordinator
+and worker always agree on `C` with zero cross-process communication.
+
+The v2 `hist_exp_decay` placement is also prefix-consistent and stable: the
+`HistogramTracker` runs in `frozen` mode with `adaptive_backtrack=False`, so a
+single DP solve produces a fixed list of positions that is filtered to
+`<= seq_len` on both sides. The solved positions are clipped to block boundaries
+by the coordinator before publishing, then shared with the workers through
+`shared.py`:
+
+- The EngineCore process creates the Manager proxy
+  (`init_sparse_shared_state`) and publishes the frozen positions
+  (`publish_sparse_positions`).
+- `AscendWorkerProc.make_worker_process` reads the proxy and hands it to each
+  worker through `process_kwargs`; `_ascend_worker_main` re-attaches it via
+  `attach_sparse_shared_state` before the worker starts (spawn-safe; under
+  `fork` the module singleton is inherited).
+- `get_checkpoint_positions` reads `get_sparse_positions()` and, before the
+  first solve (warmup), falls back to `fixed_interval_positions`.
+
+The v2 capture/restore path reuses the same per-process token-prefix buffer as
+v1, so no change is needed in `model_runner_v1.py` beyond what v1 already does.
+
+> **Transition caveat (v2).** The DP solve is a one-time placement switch from
+> the warmup `fixed_interval` fallback to the frozen DP positions. A prefix that
+> was prefilled (and captured) during warmup at fixed-interval positions, and is
+> then hit after the solve, resolves to a DP position that the worker buffer does
+> not hold. For full correctness across the transition, run the warmup as a
+> distinct throwaway phase and reset the prefix cache (e.g. the engine's
+> `/reset_prefix_cache` API) before the steady-state workload, so every prefix is
+> re-captured at the frozen DP positions.
 
 ## Risks
 
@@ -194,3 +247,11 @@ a prefix-consistent backtracking mode; it reuses the same capture/restore buffer
 3. **Recompute cost on NPU** — the extra `[C, P)` prefill on the 910B4 must be
    weighed against the memory saved. Tune the checkpoint interval to maximize
    net benefit.
+4. **v2 transition correctness** — the DP solve switches placement from the
+   warmup `fixed_interval` fallback to frozen DP positions; without a
+   prefix-cache reset across the transition, warmup-era prefixes may resolve to
+   a DP checkpoint the worker never captured (see the transition caveat above).
+5. **Manager proxy ordering** — the shared-state proxy must reach the TP workers
+   at spawn time; `init_sparse_shared_state` is idempotent and called from both
+   the coordinator and the executor so the proxy exists regardless of init
+   order.

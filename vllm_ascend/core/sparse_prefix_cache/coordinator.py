@@ -42,13 +42,59 @@ from vllm_ascend.core.sparse_prefix_cache.checkpoint import (
     RecurrentCheckpoint,
 )
 from vllm_ascend.core.sparse_prefix_cache.store import SparsePrefixCache
-from vllm_ascend.core.sparse_prefix_cache.strategies import HistogramTracker
+from vllm_ascend.core.sparse_prefix_cache.strategies import (
+    HistogramTracker,
+    fixed_interval_positions,
+)
 
 if TYPE_CHECKING:
     import torch
 
 #: (recurrent_states, conv_states) keyed by GDN layer index.
 StateSnapshot = tuple[dict[int, "torch.Tensor"], dict[int, "torch.Tensor"]]
+
+
+def get_checkpoint_positions(seq_len: int) -> list[int]:
+    """Return checkpoint positions for ``seq_len`` under the configured strategy.
+
+    This is the single placement entry point shared by the scheduler-side
+    coordinator (hit resolution) and the TP worker (capture/restore), so both
+    derive identical positions.
+
+    - ``fixed_interval``: deterministic, prefix-consistent, cross-process safe
+      with no shared state.
+    - ``hist_exp_decay``: DP-optimal placement. The DP is solved once in the
+      EngineCore process and its frozen, prefix-consistent positions are read
+      through the Manager-backed shared state (``shared.py``). Before the first
+      solve (warmup) the deterministic fixed-interval placement is used as a
+      cross-process-consistent fallback.
+    """
+    from vllm_ascend import envs
+
+    strategy = envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY
+    interval = int(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL)
+    block_size = int(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE)
+
+    if strategy == "fixed_interval":
+        return fixed_interval_positions(seq_len, interval, block_size)
+
+    if strategy == "hist_exp_decay":
+        from vllm_ascend.core.sparse_prefix_cache.shared import (
+            get_sparse_positions,
+        )
+
+        positions = get_sparse_positions()
+        if positions is None:
+            # DP not solved yet: warmup fallback (prefix-consistent, safe).
+            return fixed_interval_positions(seq_len, interval, block_size)
+        # positions are already sorted and block-clipped by the publisher;
+        # filtering to ``<= seq_len`` preserves prefix-consistency.
+        return [p for p in positions if 0 < p <= seq_len]
+
+    raise NotImplementedError(
+        f"unknown sparse prefix cache strategy {strategy!r}; expected "
+        "'fixed_interval' or 'hist_exp_decay'."
+    )
 
 
 @dataclass(frozen=True)

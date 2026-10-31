@@ -116,10 +116,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED": lambda: bool(
         int(os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED", "0"))
     ),
-    # Checkpoint placement strategy. Only "hist_exp_decay" (DP-optimal) is
-    # implemented; anything else falls back to frozen balanced placement.
+    # Checkpoint placement strategy. "fixed_interval" (default) places
+    # checkpoints at a fixed token interval and is prefix-consistent, so it is
+    # cross-process safe: the scheduler-side coordinator and the TP workers
+    # derive identical positions without sharing state. "hist_exp_decay" is the
+    # DP-optimal strategy and requires a cross-process-shared overlap histogram
+    # (reserved for v2, not yet wired into the cross-process handoff).
     "VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY": lambda: os.getenv(
-        "VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY", "hist_exp_decay"
+        "VLLM_ASCEND_SPARSE_PREFIX_CACHE_STRATEGY", "fixed_interval"
     ),
     # Byte budget (GB) for the GDN recurrent-state checkpoint store.
     "VLLM_ASCEND_SPARSE_PREFIX_CACHE_BUDGET_GB": lambda: float(
@@ -153,6 +157,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # clipping.
     "VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL": lambda: int(
         os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL", "256")
+    ),
+    # Number of overlap-depth observations (cache hits) to accumulate before
+    # solving the DP once and freezing the hist_exp_decay placement. Before this
+    # threshold the coordinator and workers fall back to the deterministic
+    # fixed_interval placement (prefix-consistent, cross-process safe). The DP
+    # solve is a one-time transition: see the design doc for the prefix-cache
+    # reset recommended across the transition.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_WARMUP_REQUESTS": lambda: int(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_WARMUP_REQUESTS", "100")
+    ),
+    # Checkpoint budget M for the DP placement (number of recurrent-state
+    # checkpoints placed per prefix). Should be sized so that
+    # M * recurrent_state_bytes_per_checkpoint fits the memory budget.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_NUM_CHECKPOINTS": lambda: int(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_NUM_CHECKPOINTS", "16")
     ),
 }
 
