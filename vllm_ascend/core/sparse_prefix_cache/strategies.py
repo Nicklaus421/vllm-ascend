@@ -44,6 +44,32 @@ def balanced_positions(seq_len: int, budget: int) -> list[int]:
     return list(range(block, seq_len + 1, block))[:budget]
 
 
+def fixed_interval_positions(
+    seq_len: int, interval: int, block_size: int
+) -> list[int]:
+    """Return prefix-consistent checkpoint positions every ``interval`` tokens.
+
+    This is the deterministic placement used by the v1 sparse prefix cache: the
+    scheduler-side coordinator and the TP worker must independently derive the
+    *same* checkpoint positions for a prefix without sharing state across
+    processes. Unlike :func:`balanced_positions` (whose spacing depends on the
+    full prefix length), these positions are fixed multiples of ``interval`` and
+    therefore a monotone subset as ``seq_len`` grows — so a hit at ``P`` recovers
+    the exact checkpoint ``C <= P`` that was captured when the longer prefix was
+    originally stored.
+
+    Each position is clipped down to a ``block_size`` boundary (the granularity
+    at which vLLM commits recurrent state) and de-duplicated.
+    """
+    clipped: list[int] = []
+    for pos in range(interval, seq_len + 1, interval):
+        c = (pos // block_size) * block_size
+        if c <= 0 or c in clipped:
+            continue
+        clipped.append(c)
+    return clipped
+
+
 # ---------------------------------------------------------------------------
 # DP-optimal checkpoint placement (Corollary 1 from the paper)
 # ---------------------------------------------------------------------------

@@ -97,6 +97,9 @@ Environment variables are defined centrally in `vllm_ascend/envs.py`:
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_REPLAN_INTERVAL`
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_LAPLACE_ALPHA`
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE`
+- `VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL` (v1 fixed-interval
+  placement, default 256; prefix-consistent so the coordinator and TP worker
+  agree on `C` without cross-process state)
 
 ## How It Works
 
@@ -123,58 +126,63 @@ eviction; GDN checkpoints are evicted from the smallest position first.
 
 ## Integration points
 
-The pure orchestration is in `vllm_ascend/core/sparse_prefix_cache/`; the runner
-glue is `runner.py` (`SparsePrefixCacheHook`), which reuses vLLM's
-`MambaStateCopyFunc` machinery to move state between live blocks and the store.
-The three call sites, against the vllm-ascend v1 runner:
+The pure orchestration is in `vllm_ascend/core/sparse_prefix_cache/`; the tensor
+plumbing is `runner.py` (`capture_checkpoint_state` / `restore_checkpoint_state`),
+which reuses vLLM's `MambaStateCopyFunc` machinery to move state between live
+blocks and the store. The v1 implementation is **cross-process safe**: the
+scheduler-side coordinator and the TP workers run in separate processes, so
+instead of sharing a store they both derive checkpoint positions from the same
+deterministic, prefix-consistent fixed-interval placement
+(`fixed_interval_positions`), and the worker keeps its own per-process state
+buffer keyed by the token prefix.
 
 1. **Capture after prefill** — in `vllm_ascend/worker/model_runner_v1.py`
    (`_update_states_after_model_execute`, entry point `_maybe_capture_sparse_checkpoints`),
-   after the recurrent state is committed to its block during the forward, call
-   `hook.capture(prefix_key, seq_len, kv_caches_by_layer, block_ids)`.
-   `prefix_key = tuple(req_state.prompt_token_ids)`; `block_ids` is the request's
-   mamba block table, where the state after token `pos` lives in
-   `block_ids[pos // block_size - 1]`. Multi-position capture requires
-   `mamba_cache_mode='all'` (block-indexed recurrent state).
+   after the recurrent state is committed to its block during the forward, the
+   worker slices the state at each checkpoint position and stores it in
+   `self._sparse_state_buffer`, keyed by `tuple(prompt_token_ids[:pos])`.
+   `block_ids` is the request's mamba block table, where the state after token
+   `pos` lives in `block_ids[pos // block_size - 1]`. Multi-position capture
+   requires `mamba_cache_mode='all'` (block-indexed recurrent state).
 
 2. **Hit resolution** — in `vllm_ascend/patch/platform/patch_kv_cache_coordinator.py`
    (`AscendHybridKVCacheCoordinator.find_longest_cache_hit`), the full-attention
    group already yields the dense overlap depth `P`. For the Mamba group,
-   `_resolve_sparse_mamba_hit(P, request_id, prompt_token_ids)` consults
-   `hook.resolve(prefix_key, P)` with
-   `prefix_key = tuple(prompt_token_ids[:P])` instead of the dense block pool;
-   the resulting `checkpoint_position` `C` is the mamba hit length, so the hybrid
-   `num_computed_tokens` is rewound to `C`. The resolved `SparseHit` is recorded
-   as a *pending hit* keyed by `request_id` for the worker to consume.
+   `_resolve_sparse_mamba_hit(P)` recomputes the fixed-interval positions up to
+   `P` and returns the largest `C <= P` (`0` when none), rewinding the hybrid
+   `num_computed_tokens` to `C`. No store, request identity, or cross-process
+   handoff is involved.
 
 3. **Restore + recompute** — in `vllm_ascend/worker/model_runner_v1.py`
-   (`execute_model`, `_maybe_restore_sparse_checkpoints`, before the forward), a
-   pending hit is popped by `req_id` and `hook.restore(...)` copies the
-   checkpoint into the sequence's state block (`dest_block_idx =
-   C // block_size - 1`). `vllm_ascend/ops/gdn.py`
+   (`execute_model`, `_maybe_restore_sparse_checkpoints`, before the forward), the
+   worker looks up `tuple(prompt_token_ids[:C])` in `self._sparse_state_buffer`
+   and, on a hit, copies the checkpoint into the sequence's state block
+   (`dest_block_idx = C // block_size - 1`). `vllm_ascend/ops/gdn.py`
    (`AscendGatedDeltaNetAttention._forward_core`) then reads the restored
    `initial_state = ssm_state[prefill_state_indices]` and runs
    `chunk_gated_delta_rule(initial_state=...)` over `[C, P)` exactly as the
-   existing resume path does.
+   existing resume path does. A buffer miss (dense hit or chunked continuation)
+   leaves the already-present state untouched.
 
-   The store is keyed by the *token prefix* (`tuple(prompt_token_ids[:len])`),
+   The buffer is keyed by the *token prefix* (`tuple(prompt_token_ids[:pos])`),
    not `block_hashes`, because the worker-side `CachedRequestState` exposes
-   `prompt_token_ids`/`req_id` but not `block_hashes`. `request_id` and
-   `prompt_token_ids` are handed to the coordinator by a small patch on
-   `KVCacheManager.get_computed_blocks` (which stashes them on the coordinator
-   before calling `find_longest_cache_hit`).
+   `prompt_token_ids`/`req_id` but not `block_hashes`.
 
 `vllm_ascend/ops/gdn_attn_builder.py`
 (`AscendGDNAttentionMetadataBuilder.build`) is where `common_prefix_len`,
 `num_computed_tokens` and `prefill_state_indices` are materialized into
 `GDNAttentionMetadata`; the rewind from `P` to `C` reaches it through the
 coordinator's reduced `hit_length` (`num_computed_tokens = C`), so no change is
-needed there — the pending-hit restore above is the only tensor-side hook.
+needed there.
 
-The coordinator and runner share the hook through a process-wide singleton
-(`set_sparse_prefix_cache_hook`/`get_sparse_prefix_cache_hook`), which assumes
-the default single-process engine. A multiprocessing engine would need an IPC
-handoff instead.
+The v1 placement is a fixed interval
+(`VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL`, default 256) clipped to
+block boundaries. It is prefix-consistent: the positions for a hit of length `P`
+are exactly the subset of the positions for the longer originally-captured
+prefix, so the coordinator and worker always agree on `C` with zero
+cross-process communication. The DP-optimal `hist_exp_decay` strategy (v2)
+additionally needs to synchronize the overlap histogram across processes and use
+a prefix-consistent backtracking mode; it reuses the same capture/restore buffer.
 
 ## Risks
 

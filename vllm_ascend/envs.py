@@ -145,6 +145,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE": lambda: int(
         os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE", "16")
     ),
+    # Fixed interval (tokens) between sparse recurrent-state checkpoints in the
+    # v1 deterministic strategy. Positions are prefix-consistent (a monotone
+    # subset as the prefix grows), so the scheduler-side coordinator and the TP
+    # worker compute identical positions without cross-process state handoff.
+    # Should be a multiple of KERNEL_BLOCK_SIZE for clean block-boundary
+    # clipping.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL": lambda: int(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL", "256")
+    ),
 }
 
 # end-env-vars-definition

@@ -57,38 +57,31 @@ def _is_deepseek_v4_kv_cache_config(kv_cache_config: KVCacheConfig) -> bool:
     return any(_is_deepseek_v4_kv_cache_spec(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups)
 
 
-def _resolve_sparse_mamba_hit(
-    overlap_depth: int,
-    request_id: str | None,
-    prompt_token_ids: list[int] | None,
-) -> int | None:
+def _resolve_sparse_mamba_hit(overlap_depth: int) -> int | None:
     """Resolve the sparse recurrent-state hit length for a Mamba group.
 
     Returns ``None`` when sparse prefix caching is disabled (the caller falls
-    back to the dense Mamba block pool) or when the request identity/tokens are
-    unavailable; otherwise returns the nearest checkpoint position ``C <=
-    overlap_depth`` (``0`` when no checkpoint is cached for this prefix). On a
-    positive hit the checkpoint is registered under ``request_id`` so the worker
-    restores it before the recompute prefill.
+    back to the dense Mamba block pool); otherwise returns the nearest
+    checkpoint position ``C <= overlap_depth`` (``0`` when no checkpoint is
+    placed for this prefix length).
 
-    The store is keyed by the token prefix (``prompt_token_ids[:overlap_depth]``)
-    rather than ``block_hashes`` because the worker-side ``CachedRequestState``
-    exposes ``prompt_token_ids`` but not ``block_hashes`` (which is a
-    scheduler-only concept).
+    The placement is deterministic and prefix-consistent (a fixed interval
+    clipped to block boundaries), so this runs purely off ``overlap_depth``
+    without consulting any tensor store or the worker process. This is what lets
+    the scheduler-side coordinator and the TP worker agree on ``C`` despite
+    running in different processes: the worker captures checkpoints at the same
+    fixed positions during the original prefill and restores them autonomously
+    (see ``model_runner_v1.py``), keyed by ``tuple(prompt_token_ids[:C])``.
     """
-    from vllm_ascend.core.sparse_prefix_cache import get_sparse_prefix_cache_hook
+    from vllm_ascend import envs
+    from vllm_ascend.core.sparse_prefix_cache import fixed_interval_positions
 
-    hook = get_sparse_prefix_cache_hook()
-    if hook is None:
+    if not envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_ENABLED:
         return None
-    if request_id is None or prompt_token_ids is None:
-        return None
-    prefix_key = tuple(prompt_token_ids[:overlap_depth])
-    hit = hook.resolve(prefix_key, overlap_depth)
-    if hit is None:
-        return 0
-    hook.coordinator.register_pending_hit(request_id, hit)
-    return hit.checkpoint_position
+    interval = int(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL)
+    block_size = int(envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE)
+    positions = fixed_interval_positions(overlap_depth, interval, block_size)
+    return positions[-1] if positions else 0
 
 
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
@@ -327,11 +320,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 # Rewinding the hybrid hit length to C makes the scheduler emit
                 # a chunked prefill over [C, P) with the restored initial state.
                 if isinstance(spec, MambaSpec):
-                    sparse_hit_length = _resolve_sparse_mamba_hit(
-                        curr_hit_length,
-                        getattr(self, "_sparse_request_id", None),
-                        getattr(self, "_sparse_prompt_token_ids", None),
-                    )
+                    sparse_hit_length = _resolve_sparse_mamba_hit(curr_hit_length)
                     if sparse_hit_length is not None:
                         curr_hit_length = sparse_hit_length
                         for group_id in group_ids:
@@ -576,25 +565,3 @@ _kv_cache_manager = sys.modules.get("vllm.v1.core.kv_cache_manager")
 if _kv_cache_manager is None:
     import vllm.v1.core.kv_cache_manager as _kv_cache_manager  # noqa: E402
 _kv_cache_manager.get_kv_cache_coordinator = get_kv_cache_coordinator  # type: ignore[attr-defined]
-
-# Thread the request identity + token ids into the coordinator before
-# ``find_longest_cache_hit`` runs. Upstream only forwards ``block_hashes``
-# (a scheduler-only concept), but the sparse prefix cache keys its store by
-# ``prompt_token_ids`` and its pending-hit handoff by ``request_id`` because
-# the worker-side ``CachedRequestState`` carries those, not ``block_hashes``.
-_orig_get_computed_blocks = _kv_cache_manager.KVCacheManager.get_computed_blocks
-
-
-def _patched_get_computed_blocks(self, request):
-    coordinator = getattr(self, "coordinator", None)
-    if coordinator is not None:
-        try:
-            coordinator._sparse_request_id = request.request_id
-            coordinator._sparse_prompt_token_ids = request.prompt_token_ids
-        except Exception:
-            # Coordinators that don't carry sparse state ignore the handoff.
-            pass
-    return _orig_get_computed_blocks(self, request)
-
-
-_kv_cache_manager.KVCacheManager.get_computed_blocks = _patched_get_computed_blocks  # type: ignore[attr-defined]

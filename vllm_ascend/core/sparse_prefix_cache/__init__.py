@@ -35,6 +35,7 @@ from vllm_ascend.core.sparse_prefix_cache.strategies import (
     HistogramTracker,
     backtrack,
     balanced_positions,
+    fixed_interval_positions,
     laplace_smoothing,
     solve_dp,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "SparsePrefixCacheHook",
     "backtrack",
     "balanced_positions",
+    "fixed_interval_positions",
     "capture_checkpoint_state",
     "get_sparse_prefix_cache_hook",
     "laplace_smoothing",
