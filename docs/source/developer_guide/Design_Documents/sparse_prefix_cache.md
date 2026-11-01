@@ -108,7 +108,10 @@ Environment variables are defined centrally in `vllm_ascend/envs.py`:
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_BIN_SIZE`
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_GAMMA`
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_REPLAN_INTERVAL`
-- `VLLM_ASCEND_SPARSE_PREFIX_CACHE_LAPLACE_ALPHA`
+- `VLLM_ASCEND_SPARSE_PREFIX_CACHE_LAPLACE_ALPHA` (default 1.0; the *total*
+  pseudo-count mass spread uniformly over the active overlap-depth bins, not a
+  per-bin additive constant — keeps the histogram from being flooded to
+  uniformity when it spans thousands of bins)
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_KERNEL_BLOCK_SIZE`
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_CHECKPOINT_INTERVAL` (v1 fixed-interval
   placement, default 256; prefix-consistent so the coordinator and TP worker
@@ -118,6 +121,12 @@ Environment variables are defined centrally in `vllm_ascend/envs.py`:
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_NUM_CHECKPOINTS` (v2, default 16; the DP
   checkpoint budget `M`, sized so `M * recurrent_state_bytes` fits the memory
   budget)
+
+> `VLLM_ASCEND_SPARSE_PREFIX_CACHE_BUDGET_GB` is the byte budget of the
+> budgeted FIFO store (`store.py`). The active DP path uses the per-process
+> token-prefix buffer and is governed by `NUM_CHECKPOINTS` (checkpoints per
+> prefix), not by `BUDGET_GB`; `BUDGET_GB` is currently not enforced in the
+> active path.
 
 ## How It Works
 

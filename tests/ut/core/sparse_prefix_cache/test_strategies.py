@@ -197,10 +197,28 @@ def test_tracker_periodic_replans():
 def test_laplace_smoothing_up_to_last_nonzero():
     counts = np.array([0.0, 2.0, 0.0, 3.0, 0.0, 0.0])
     smoothed = laplace_smoothing(counts, alpha=1.0)
-    # Last non-zero bin is index 3; bins [0, 3) get +alpha.
-    assert smoothed[0] == 1.0
-    assert smoothed[1] == 3.0
-    assert smoothed[2] == 1.0
-    assert smoothed[3] == 3.0
+    # Last non-zero bin is index 3, so 4 active bins share the total
+    # pseudo-count mass of 1.0 -> +0.25 per bin. Bins past the last non-zero
+    # bin are untouched.
+    np.testing.assert_allclose(smoothed[0], 0.25)
+    np.testing.assert_allclose(smoothed[1], 2.25)
+    np.testing.assert_allclose(smoothed[2], 0.25)
+    np.testing.assert_allclose(smoothed[3], 3.25)
     assert smoothed[4] == 0.0
     assert smoothed[5] == 0.0
+
+
+def test_laplace_smoothing_does_not_flood_wide_histogram():
+    # A wide, sparse histogram must not be flooded into uniformity: the total
+    # pseudo-count mass stays small relative to the real observations, so the
+    # DP sees the true distribution instead of an (almost) flat one.
+    counts = np.zeros(2000)
+    counts[100] = 50.0  # one strong cluster
+    counts[1500] = 30.0  # a second cluster
+    counts[1999] = 20.0
+    smoothed = laplace_smoothing(counts, alpha=1.0)
+    # The smoothing mass is 1.0 spread over 2000 bins, i.e. negligible per bin.
+    assert smoothed[0] < 0.001
+    assert smoothed.sum() == pytest.approx(counts.sum() + 1.0)
+    # The cluster contrast is preserved.
+    assert smoothed[100] > 49.9

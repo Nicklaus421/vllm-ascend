@@ -157,13 +157,22 @@ def _bin_to_pos(bin_idx: int, bin_size: int) -> int:
 
 
 def laplace_smoothing(counts: np.ndarray, alpha: float) -> np.ndarray:
-    """Apply Laplace smoothing up to the last non-zero bin."""
+    """Apply Laplace smoothing up to the last non-zero bin.
+
+    ``alpha`` is the *total* pseudo-count mass, spread uniformly over the active
+    bins ``[0, last_nonzero_bin]``. Treating it as a total (rather than a
+    per-bin additive constant) keeps the smoothing weak and scale-invariant: a
+    histogram spanning thousands of bins no longer gets ``alpha``
+    pseudo-observations added to *every* bin, which previously flooded the
+    empirical counts and collapsed the DP to a near-uniform placement.
+    """
     smoothed = counts.copy()
     nz = np.argwhere(smoothed > 0)
     if len(nz) == 0:
         return smoothed
     max_bin_pos = nz.max().item()
-    smoothed[:max_bin_pos] += alpha
+    n_active = max_bin_pos + 1
+    smoothed[:n_active] += alpha / n_active
     return smoothed
 
 

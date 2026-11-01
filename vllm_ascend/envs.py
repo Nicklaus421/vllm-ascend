@@ -141,7 +141,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SPARSE_PREFIX_CACHE_REPLAN_INTERVAL": lambda: int(
         os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_REPLAN_INTERVAL", "100")
     ),
-    # Laplace smoothing constant applied to the overlap histogram.
+    # Laplace smoothing: total pseudo-count mass spread uniformly over the
+    # active overlap-depth bins. A single value keeps empty bins negligible no
+    # matter how wide the histogram is, so the DP-optimal placement follows the
+    # observed overlap distribution instead of collapsing to near-uniform.
     "VLLM_ASCEND_SPARSE_PREFIX_CACHE_LAPLACE_ALPHA": lambda: float(
         os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_LAPLACE_ALPHA", "1.0")
     ),

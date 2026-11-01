@@ -252,6 +252,18 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         tracker.observe(overlap_depth)
         if tracker.n_obs < self._sparse_warmup_requests:
             return
+        import numpy as np
+
+        nz = np.argwhere(tracker.counts > 0)
+        n_active = len(nz)
+        max_bin = int(nz.max()) if n_active else 0
+        logger.info(
+            "Sparse prefix cache: warmup complete (%d observations, "
+            "%d non-empty bins, max overlap depth %d tokens).",
+            tracker.n_obs,
+            n_active,
+            max_bin * tracker.bin_size,
+        )
         tracker.solve()
         self._sparse_solved = True
         fixed = tracker._fixed_positions
