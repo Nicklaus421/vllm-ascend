@@ -29,6 +29,7 @@ This module is pure CPU-side planning logic and has no NPU / vLLM dependency so
 it can be unit-tested on any host.
 """
 
+from collections import deque
 from functools import lru_cache
 
 import numpy as np
@@ -77,7 +78,7 @@ def solve_dp(
     hist: np.ndarray,
     budget: int,
 ) -> tuple[list[np.ndarray | None], int, int] | None:
-    """Solve the DP forward pass (vectorized).
+    """Solve the DP forward pass in ``O(NM)`` via the convex hull trick.
 
     Args:
         hist: overlap-depth histogram of length ``N + 1`` where ``hist[t]`` is
@@ -88,6 +89,15 @@ def solve_dp(
         ``(all_back, N, M)`` where ``all_back[m][j]`` stores the optimal split
         point for ``m`` checkpoints covering positions ``1..j``. Returns
         ``None`` for an empty histogram or zero budget.
+
+    The recurrence ``dp[m][j] = min_{s<=j} (dp[m-1][s-1] + cost(s, j))`` with
+    ``cost(s, j) = sum_{t=s}^j (t - s) * p[t]`` reduces to a lower-envelope
+    query over lines ``y = -s * x + B[s]`` evaluated at ``x = C0[j]``, where
+    ``C0``/``C1`` are the cumulative sums of ``p`` and ``t * p`` and
+    ``B[s] = dp[m-1][s-1] - C1[s-1] + s * C0[s-1]``. The slopes ``-s`` are
+    monotone decreasing and the query points ``C0[j]`` monotone non-decreasing,
+    so a single monotone deque evaluates each row in ``O(N)`` (total ``O(NM)``)
+    instead of the naive ``O(N^2 M)``.
     """
     N = len(hist) - 1  # hist[0..N], positions 1..N
     M = min(budget, N)
@@ -100,32 +110,42 @@ def solve_dp(
         return None
     p = p / total
 
-    cum_p = np.zeros(N + 2)
-    cum_pt = np.zeros(N + 2)
     t_idx = np.arange(N + 1, dtype=np.float64)
-    cum_p[1:] = np.cumsum(p)
-    cum_pt[1:] = np.cumsum(p * t_idx)
-    cpt_j = cum_pt[1:]
-    cp_j = cum_p[1:]
+    c0 = np.cumsum(p)            # c0[j] = sum_{k=0}^j p[k]
+    c1 = np.cumsum(p * t_idx)    # c1[j] = sum_{k=0}^j k * p[k]
 
-    dp_prev = cpt_j.copy()
+    # dp_prev[j] == dp[0][j] = sum_{k=1}^j k * p[k] (the k=0 term is zero).
+    dp_prev = c1.copy()
     all_back: list[np.ndarray | None] = [None]
 
-    for m in range(1, M + 1):
-        dp_curr = np.full(N + 1, np.inf)
+    for _ in range(1, M + 1):
+        dp_curr = np.zeros(N + 1)
         back_curr = np.zeros(N + 1, dtype=np.intp)
-        dp_curr[0] = 0.0
+        # Monotone lower envelope of lines y = -s * x + B[s] for s = 1..N.
+        hull: deque[tuple[float, float, int]] = deque()
         for j in range(1, N + 1):
-            s_range = np.arange(1, j + 1)
-            costs = (
-                dp_prev[s_range - 1]
-                + cpt_j[j]
-                - cum_pt[s_range]
-                - s_range * (cp_j[j] - cum_p[s_range])
-            )
-            idx = np.argmin(costs)
-            dp_curr[j] = costs[idx]
-            back_curr[j] = s_range[idx]
+            slope = -float(j)
+            intercept = dp_prev[j - 1] - c1[j - 1] + j * c0[j - 1]
+            # Drop the previous line when the new one renders it never-optimal:
+            # inter(prev2, prev) >= inter(prev, new).
+            while len(hull) >= 2:
+                m1, b1, _ = hull[-2]
+                m2, b2, _ = hull[-1]
+                if (b2 - b1) * (m2 - slope) >= (intercept - b2) * (m1 - m2):
+                    hull.pop()
+                else:
+                    break
+            hull.append((slope, intercept, j))
+            x = c0[j]
+            # Advance past lines no longer minimal at x. Strict ``>`` keeps the
+            # earliest (smallest ``s``) line on ties, matching ``np.argmin``.
+            while (
+                len(hull) >= 2
+                and hull[0][0] * x + hull[0][1] > hull[1][0] * x + hull[1][1]
+            ):
+                hull.popleft()
+            dp_curr[j] = c1[j] + hull[0][0] * x + hull[0][1]
+            back_curr[j] = hull[0][2]
         dp_prev = dp_curr
         all_back.append(back_curr)
 

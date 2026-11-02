@@ -264,10 +264,16 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             n_active,
             max_bin * tracker.bin_size,
         )
+        import time
+
+        t_solve = time.perf_counter()
         tracker.solve()
+        t_solve = time.perf_counter() - t_solve
         self._sparse_solved = True
         fixed = tracker._fixed_positions
+        t_clip = time.perf_counter()
         positions = self._clip_sparse_positions(fixed) if fixed else []
+        t_clip = time.perf_counter() - t_clip
         if not positions:
             # Degenerate/empty histogram: keep the fixed_interval warmup
             # fallback rather than publishing an empty placement.
@@ -280,13 +286,18 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             publish_sparse_positions,
         )
 
+        t_publish = time.perf_counter()
         publish_sparse_positions(positions)
+        t_publish = time.perf_counter() - t_publish
         logger.info(
             "Sparse prefix cache: solved DP placement after %d observations "
-            "(%d checkpoints: %s).",
+            "(%d checkpoints: %s; solve=%.3fs clip=%.3fs publish=%.3fs).",
             tracker.n_obs,
             len(positions),
             positions,
+            t_solve,
+            t_clip,
+            t_publish,
         )
 
     def _clip_sparse_positions(self, positions: list[int]) -> list[int]:
@@ -434,10 +445,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 # Rewinding the hybrid hit length to C makes the scheduler emit
                 # a chunked prefill over [C, P) with the restored initial state.
                 if isinstance(spec, MambaSpec):
-                    if self._sparse_tracker is not None:
+                    if self._sparse_tracker is not None and curr_hit_length > 0:
                         # Feed the dense full-attention overlap depth (P) into
                         # the DP histogram. Full attention is always processed
-                        # first, so ``curr_hit_length`` is P here.
+                        # first, so ``curr_hit_length`` is P here. A zero-length
+                        # hit (no prefix reuse) carries no placement signal and
+                        # must not count toward the warmup threshold.
                         self._observe_sparse_hit(curr_hit_length)
                     sparse_hit_length = _resolve_sparse_mamba_hit(curr_hit_length)
                     if sparse_hit_length is not None:
