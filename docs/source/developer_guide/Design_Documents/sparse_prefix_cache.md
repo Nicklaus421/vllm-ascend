@@ -121,6 +121,9 @@ Environment variables are defined centrally in `vllm_ascend/envs.py`:
 - `VLLM_ASCEND_SPARSE_PREFIX_CACHE_NUM_CHECKPOINTS` (v2, default 16; the DP
   checkpoint budget `M`, sized so `M * recurrent_state_bytes` fits the memory
   budget)
+- `VLLM_ASCEND_SPARSE_PREFIX_CACHE_RECOMPUTE_ATTN_WEIGHT` (v2, default 0.0;
+  per-bin attention-cost coefficient for the attention-aware recompute cost
+  model — see below)
 
 > `VLLM_ASCEND_SPARSE_PREFIX_CACHE_BUDGET_GB` is the byte budget of the
 > budgeted FIFO store (`store.py`). The active DP path uses the per-process
@@ -142,6 +145,24 @@ expected recompute cost. Three modes control replanning:
   re-solve every `replan_interval`.
 
 Before the first DP solve, `get_positions` falls back to balanced placement.
+
+#### Attention-aware recompute cost
+
+By default the DP minimizes the expected *number* of recomputed tokens, i.e.
+`cost(s, j) = sum_{t=s}^j (t - s) * p[t]`. This treats every recomputed token
+as equal cost, but recomputing `[C, P)` runs the full-attention layers over
+`[0, P)` again, so the per-token cost grows with the absolute position (each
+token at position `u` attends to `u` cached keys). The recurrent (GDN) layers,
+in contrast, cost a position-independent constant per token.
+
+`RECOMPUTE_ATTN_WEIGHT` enables the attention-aware model
+`cost(s, j) = sum_{t=s}^j [(t - s) + w/2 * (t^2 - s^2)] * p[t]`, where the
+per-token recompute cost is `1 + w * u` (`w * u` = attention, `1` = recurrent).
+The weighted objective still reduces to the same monotone lower-envelope query
+(now with slopes `-(w/2 * s^2 + s)`), so it remains `O(NM)`. A positive `w`
+shifts checkpoints toward the deep end, where recompute is most expensive.
+For Qwen3.8-27B with `bin_size=16` a rough value is `~0.01` (attention ≈ 1e-3 ×
+position per token, scaled by bin_size); calibrate on the target hardware.
 
 ### Checkpoint store
 

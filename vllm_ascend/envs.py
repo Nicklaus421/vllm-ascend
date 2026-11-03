@@ -176,6 +176,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SPARSE_PREFIX_CACHE_NUM_CHECKPOINTS": lambda: int(
         os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_NUM_CHECKPOINTS", "16")
     ),
+    # Per-bin attention-cost coefficient for the attention-aware recompute cost
+    # model in the DP placement. The recompute cost of a token at bin position u
+    # is modeled as ``1 + attn_weight * u``: the ``attn_weight * u`` term is the
+    # full-attention cost (which grows with the absolute position u because it
+    # attends to [0, u)), and the ``1`` is the position-independent recurrent
+    # cost. 0.0 disables the weighting and recovers the original unit-cost
+    # model. For Qwen3.8-27B with bin_size=16 a rough value is ~0.01 (attention
+    # ~1e-3 * position per token, scaled by bin_size); calibrate on hardware.
+    "VLLM_ASCEND_SPARSE_PREFIX_CACHE_RECOMPUTE_ATTN_WEIGHT": lambda: float(
+        os.getenv("VLLM_ASCEND_SPARSE_PREFIX_CACHE_RECOMPUTE_ATTN_WEIGHT", "0.0")
+    ),
 }
 
 # end-env-vars-definition

@@ -79,6 +79,72 @@ def _naive_dp(hist: np.ndarray, budget: int):
     return positions, dp[M][N]
 
 
+def _naive_dp_weighted(hist: np.ndarray, budget: int, attn_weight: float):
+    """Brute-force DP for the attention-aware cost model.
+
+    ``cost(s, j) = sum_{t=s}^{j} [(t - s) + attn_weight/2 * (t^2 - s^2)] * p[t]``
+    where the ``attn_weight`` term models full-attention recompute cost growing
+    with the absolute position, and the ``(t - s)`` term is the
+    position-independent recurrent cost.
+    """
+    N = len(hist) - 1
+    M = min(budget, N)
+    p = np.array(hist, dtype=np.float64)
+    total = p.sum()
+    assert total > 1e-12
+    p = p / total
+    half_w = attn_weight / 2.0
+
+    inf = float("inf")
+    dp = [[inf] * (N + 1) for _ in range(M + 1)]
+    back = [[0] * (N + 1) for _ in range(M + 1)]
+
+    dp[0][0] = 0.0
+    for j in range(1, N + 1):
+        dp[0][j] = sum((t + half_w * t * t) * p[t] for t in range(1, j + 1))
+
+    for m in range(1, M + 1):
+        dp[m][0] = 0.0
+        for j in range(1, N + 1):
+            best = inf
+            best_s = 0
+            for s in range(1, j + 1):
+                seg_cost = sum(
+                    ((t - s) + half_w * (t * t - s * s)) * p[t]
+                    for t in range(s, j + 1)
+                )
+                c = dp[m - 1][s - 1] + seg_cost
+                if c < best:
+                    best = c
+                    best_s = s
+            dp[m][j] = best
+            back[m][j] = best_s
+
+    positions = []
+    j = N
+    for m in range(M, 0, -1):
+        if j <= 0:
+            break
+        s = back[m][j]
+        positions.append(s)
+        j = s - 1
+    positions.sort()
+    return positions, dp[M][N]
+
+
+def _weighted_recompute_cost(
+    positions: list[int], p: np.ndarray, n: int, attn_weight: float
+) -> float:
+    """Evaluate the attention-aware recompute cost of a placement."""
+    half_w = attn_weight / 2.0
+    total = 0.0
+    for t in range(1, n + 1):
+        candidates = [s for s in positions if s <= t]
+        s = max(candidates) if candidates else 0
+        total += ((t - s) + half_w * (t * t - s * s)) * p[t]
+    return total
+
+
 # ---------------------------------------------------------------------------
 # solve_dp / backtrack
 # ---------------------------------------------------------------------------
@@ -128,6 +194,64 @@ def test_solve_dp_matches_naive_cost():
 
         _, want_cost = _naive_dp(hist, budget)
         assert np.isclose(cost_of(positions), want_cost, atol=1e-9)
+
+
+def test_solve_dp_attn_weight_matches_naive():
+    rng = np.random.RandomState(7)
+    for _ in range(50):
+        N = rng.randint(1, 25)
+        budget = rng.randint(1, 5)
+        hist = rng.uniform(0.1, 1.0, size=N + 1)
+        attn_weight = rng.uniform(0.0, 2.0)
+
+        result = solve_dp(hist, budget, attn_weight=attn_weight)
+        assert result is not None
+        all_back, n, m = result
+        got = backtrack(all_back, m, n)
+        want, _ = _naive_dp_weighted(hist, budget, attn_weight)
+        assert got == want, (
+            f"hist={hist.tolist()}, budget={budget}, attn_weight={attn_weight}"
+        )
+
+
+def test_solve_dp_attn_weight_zero_equals_unit_cost():
+    # attn_weight=0 must reproduce the original unit-cost placement exactly.
+    rng = np.random.RandomState(8)
+    for _ in range(30):
+        N = rng.randint(1, 25)
+        budget = rng.randint(1, 5)
+        hist = rng.uniform(0.1, 1.0, size=N + 1)
+        a = solve_dp(hist, budget, attn_weight=0.0)
+        b = solve_dp(hist, budget)
+        assert a is not None and b is not None
+        assert backtrack(a[0], a[2], a[1]) == backtrack(b[0], b[2], b[1])
+
+
+def test_solve_dp_attn_weight_improves_weighted_cost():
+    # Flat overlap distribution: the attention-aware placement must shift
+    # checkpoints deeper (deep recompute is more expensive per token) and
+    # achieve a strictly lower weighted recompute cost than the unit placement.
+    N = 40
+    hist = np.ones(N + 1)
+    hist[0] = 0.0
+    budget = 3
+    attn_weight = 1.0
+
+    all_back, n, m = solve_dp(hist, budget, attn_weight=attn_weight)
+    weighted_pos = backtrack(all_back, m, n)
+    unit_all_back, unit_n, unit_m = solve_dp(hist, budget, attn_weight=0.0)
+    unit_pos = backtrack(unit_all_back, unit_m, unit_n)
+
+    assert weighted_pos != unit_pos
+    # Checkpoints shift toward the deep end under the attention-aware model.
+    assert sum(weighted_pos) > sum(unit_pos)
+
+    p = hist / hist.sum()
+    weighted_cost_weighted = _weighted_recompute_cost(
+        weighted_pos, p, n, attn_weight
+    )
+    weighted_cost_unit = _weighted_recompute_cost(unit_pos, p, n, attn_weight)
+    assert weighted_cost_weighted < weighted_cost_unit
 
 
 def test_backtrack_positions_sorted_and_bounded():

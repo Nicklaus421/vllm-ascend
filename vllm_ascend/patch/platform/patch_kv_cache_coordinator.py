@@ -231,6 +231,9 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             # of positions so capture (worker) and resolve (coordinator) agree
             # across processes with zero per-prefix bookkeeping.
             adaptive_backtrack=False,
+            attn_weight=float(
+                envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_RECOMPUTE_ATTN_WEIGHT
+            ),
         )
         self._sparse_warmup_requests = int(
             envs.VLLM_ASCEND_SPARSE_PREFIX_CACHE_WARMUP_REQUESTS

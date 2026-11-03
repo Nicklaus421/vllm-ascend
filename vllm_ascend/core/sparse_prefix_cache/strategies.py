@@ -77,6 +77,7 @@ def fixed_interval_positions(
 def solve_dp(
     hist: np.ndarray,
     budget: int,
+    attn_weight: float = 0.0,
 ) -> tuple[list[np.ndarray | None], int, int] | None:
     """Solve the DP forward pass in ``O(NM)`` via the convex hull trick.
 
@@ -84,6 +85,12 @@ def solve_dp(
         hist: overlap-depth histogram of length ``N + 1`` where ``hist[t]`` is
             the weight of overlap depth ``t`` for ``t = 0..N``.
         budget: checkpoint budget ``M``.
+        attn_weight: per-bin attention-cost coefficient. The recompute cost of a
+            token at position ``u`` is ``1 + attn_weight * u``: the
+            ``attn_weight * u`` term models the full-attention layers, whose
+            per-token cost grows with the absolute position ``u`` (they attend
+            to ``[0, u)``), while the ``1`` is the position-independent
+            recurrent/state cost. ``0.0`` recovers the original unit-cost model.
 
     Returns:
         ``(all_back, N, M)`` where ``all_back[m][j]`` stores the optimal split
@@ -91,13 +98,17 @@ def solve_dp(
         ``None`` for an empty histogram or zero budget.
 
     The recurrence ``dp[m][j] = min_{s<=j} (dp[m-1][s-1] + cost(s, j))`` with
-    ``cost(s, j) = sum_{t=s}^j (t - s) * p[t]`` reduces to a lower-envelope
-    query over lines ``y = -s * x + B[s]`` evaluated at ``x = C0[j]``, where
-    ``C0``/``C1`` are the cumulative sums of ``p`` and ``t * p`` and
-    ``B[s] = dp[m-1][s-1] - C1[s-1] + s * C0[s-1]``. The slopes ``-s`` are
-    monotone decreasing and the query points ``C0[j]`` monotone non-decreasing,
-    so a single monotone deque evaluates each row in ``O(N)`` (total ``O(NM)``)
-    instead of the naive ``O(N^2 M)``.
+    ``cost(s, j) = sum_{t=s}^j [(t - s) + attn_weight/2 * (t^2 - s^2)] * p[t]``
+    reduces to a lower-envelope query over lines ``y = slope * x + B[s]``
+    evaluated at ``x = C0[j]``, where ``C0``/``C1``/``C2`` are the cumulative
+    sums of ``p``, ``t * p`` and ``t^2 * p``,
+    ``slope = -(attn_weight/2 * s^2 + s)`` and
+    ``B[s] = dp[m-1][s-1] - attn_weight/2 * C2[s-1] - C1[s-1]
+             + (attn_weight/2 * s^2 + s) * C0[s-1]``.
+    The slopes are monotone decreasing for ``attn_weight >= 0`` and the query
+    points ``C0[j]`` monotone non-decreasing, so a single monotone deque
+    evaluates each row in ``O(N)`` (total ``O(NM)``) instead of the naive
+    ``O(N^2 M)``.
     """
     N = len(hist) - 1  # hist[0..N], positions 1..N
     M = min(budget, N)
@@ -111,21 +122,28 @@ def solve_dp(
     p = p / total
 
     t_idx = np.arange(N + 1, dtype=np.float64)
-    c0 = np.cumsum(p)            # c0[j] = sum_{k=0}^j p[k]
-    c1 = np.cumsum(p * t_idx)    # c1[j] = sum_{k=0}^j k * p[k]
+    c0 = np.cumsum(p)                  # c0[j] = sum_{k=0}^j p[k]
+    c1 = np.cumsum(p * t_idx)          # c1[j] = sum_{k=0}^j k * p[k]
+    c2 = np.cumsum(p * t_idx * t_idx)  # c2[j] = sum_{k=0}^j k^2 * p[k]
 
-    # dp_prev[j] == dp[0][j] = sum_{k=1}^j k * p[k] (the k=0 term is zero).
-    dp_prev = c1.copy()
+    half_w = attn_weight / 2.0
+    # dp_prev[j] == dp[0][j] = sum_{k=1}^j (k + half_w * k^2) * p[k]: the cost
+    # of recomputing [0, j] with no checkpoint (the k=0 term is zero).
+    dp_prev = c1 + half_w * c2
     all_back: list[np.ndarray | None] = [None]
 
     for _ in range(1, M + 1):
         dp_curr = np.zeros(N + 1)
         back_curr = np.zeros(N + 1, dtype=np.intp)
-        # Monotone lower envelope of lines y = -s * x + B[s] for s = 1..N.
+        # Monotone lower envelope of lines y = slope * x + B[s] for s = 1..N.
         hull: deque[tuple[float, float, int]] = deque()
         for j in range(1, N + 1):
-            slope = -float(j)
-            intercept = dp_prev[j - 1] - c1[j - 1] + j * c0[j - 1]
+            s = float(j)
+            slope = -(half_w * s * s + s)
+            intercept = (
+                dp_prev[j - 1] - half_w * c2[j - 1] - c1[j - 1]
+                + (half_w * s * s + s) * c0[j - 1]
+            )
             # Drop the previous line when the new one renders it never-optimal:
             # inter(prev2, prev) >= inter(prev, new).
             while len(hull) >= 2:
@@ -144,7 +162,7 @@ def solve_dp(
                 and hull[0][0] * x + hull[0][1] > hull[1][0] * x + hull[1][1]
             ):
                 hull.popleft()
-            dp_curr[j] = c1[j] + hull[0][0] * x + hull[0][1]
+            dp_curr[j] = c1[j] + half_w * c2[j] + hull[0][0] * x + hull[0][1]
             back_curr[j] = hull[0][2]
         dp_prev = dp_curr
         all_back.append(back_curr)
@@ -220,6 +238,7 @@ class HistogramTracker:
         alpha: float = 1.0,
         bin_size: int = 1,
         adaptive_backtrack: bool = True,
+        attn_weight: float = 0.0,
     ) -> None:
         self.max_len = max_len
         self.budget = budget
@@ -229,6 +248,7 @@ class HistogramTracker:
         self.replan_interval = replan_interval
         self.bin_size = max(1, bin_size)
         self.adaptive_backtrack = adaptive_backtrack
+        self.attn_weight = attn_weight  # attention-aware recompute cost
 
         n_bins = max_len // self.bin_size + 1
         self.counts = np.zeros(n_bins, dtype=np.float64)
@@ -260,7 +280,9 @@ class HistogramTracker:
             }
         )
         smoothed = laplace_smoothing(self.counts, self.alpha)
-        self._dp_result = solve_dp(smoothed, self.budget)
+        self._dp_result = solve_dp(
+            smoothed, self.budget, attn_weight=self.attn_weight
+        )
         if self._dp_result is None:
             self._fixed_positions = None
         else:
